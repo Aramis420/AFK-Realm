@@ -114,7 +114,7 @@ function containerPage() {
   refresh();
   const tile = (ic, title, text, on) => h('button.tile', { type: 'button', onclick: on }, h('span.ic', {}, icon(ic)), h('span', {}, h('b', {}, title), h('span', {}, text)));
   const normal = tile('server', T('Normally on this computer'), T('The usual way: everything runs here. Nothing extra to install.'), () => { wiz.docker = false; show('welcome', 'container'); });
-  const docker = tile('folder', T('Isolated in Docker'), T('Everything runs in Linux containers on Debian Trixie. Needs Docker; Windows needs no Visual Studio then.'), () => { wiz.docker = true; show('welcome', 'container'); });
+  const docker = tile('power', T('Isolated in Docker'), T('Everything runs in Linux containers on Debian Trixie. Needs Docker; Windows needs no Visual Studio then.'), () => { wiz.docker = true; show('welcome', 'container'); });
   return page(T('How should the server run?'),
     h('p', {}, T('You can change this later only by installing again. Choose what suits this computer.')),
     h('div', {}, normal, docker),

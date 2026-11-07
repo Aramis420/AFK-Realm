@@ -1905,6 +1905,7 @@
     "There is no update to install.": "",
     "Nothing was chosen to restore.": "",
     "Stop the server first.": "",
+    "The container files of this server are incomplete; run \"Repair\".": "",
     "Step 1: dbc, maps and cameras ...": "",
     "ERROR during extraction. Is this the right game folder, and is the game closed?": "",
     "CoA DBC tables from the client archives ...": "",

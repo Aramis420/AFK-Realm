@@ -2881,6 +2881,7 @@ function Write-ContainerBootstrap {
         'i=0'
         'while [ $i -lt 90 ]; do'
         '  if /opt/afk/mysql/bin/mysqladmin --socket=$SOCKET --user=root --protocol=socket ping >/dev/null 2>&1; then break; fi'
+        '  if [ $i -eq 9 ]; then export MYSQL_PWD="$AFK_BOOT_PW"; fi'
         '  i=$((i+1)); sleep 1'
         'done'
         'if [ $i -ge 90 ]; then echo "The new database did not start."; kill $PID 2>/dev/null; exit 1; fi'
@@ -2900,7 +2901,7 @@ function Write-ContainerBootstrap {
 # (it says no when the first rights of the containers are missing or the password changed)?
 function Test-ContainerLogin {
     $out = Get-ProgramOutput 'docker' @('compose', '-f', $Paths.Compose, 'exec', '-T', '-e', ('MYSQL_PWD=' + $password),
-        'db', '/opt/afk/mysql/bin/mysql', '-h127.0.0.1', '-uroot', '--batch', '-e', 'SELECT 1')
+        'db', '/opt/afk/mysql/bin/mysql', '-h127.0.0.1', '-uroot', '--port', [string]$DatabasePort, '--protocol=tcp', '--batch', '-e', 'SELECT 1')
     return ($null -ne $out)
 }
 
