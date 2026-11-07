@@ -16,6 +16,7 @@ dotnet publish app/AfkRealm.csproj -c Release -r win-x64 --self-contained true -
 ```
 
 - This is the real verification step — there are no tests or linter. Use `linux-x64` / `linux-arm64` for Linux; needs the .NET 8 SDK per `global.json`. CI runs it for all three RIDs on every PR.
+- Local verification also needs PowerShell 7 (`pwsh`) to syntax-check `engine.ps1`, and `mono` (`build.sh`) only when you build or touch the classic build.
 - Beyond publishing, CI only syntax-parses `engine/engine.ps1` (on the Windows runner); it never runs the app.
 - Classic build: `build.bat` (Windows csc.exe) or `build.sh` (Mono `mcs`, needs `mono-devel`). CI never builds it, so C# 6+ syntax in `src/` passes CI but breaks the classic build.
 - No NuGet packages anywhere; `app/Shims/` reimplements classic-only APIs (JavaScriptSerializer, ProtectedData) so shared code compiles on .NET 8.
@@ -50,11 +51,22 @@ dotnet publish app/AfkRealm.csproj -c Release -r win-x64 --self-contained true -
 - Must parse under Windows PowerShell 5.1 and pwsh 7 (`#requires -Version 5.1`). CI parses it with pwsh 7 only, so check 5.1 compatibility yourself (no `??`, ternary `? :`, `-Parallel`).
 - Modes: Install, Update, Rebuild, Setup, Backup, Restore, RestoreParts, Modules. Run standalone, e.g. `pwsh engine/engine.ps1 -InstallRoot <dir> -NonInteractive -Mode Update`.
 - In `-NonInteractive` mode the DB password comes from `$env:AC_DB_PASSWORD`, and progress is machine-readable lines the app depends on: `##AC|PHASE|…`, `##AC|CHANGE|…`, `##AC|SOURCES|…`, `##AC|NOTE|…`, `##AC|DONE|…`, `##AC|FAIL|…`. Keep this format stable.
+- Phase ids are mirrored in `src/Engine.cs` (`EngineRunner.For`); the app renders that list (weights drive the progress bar). Unknown ids are ignored; missing ones just never fire, so progress stays below 100% until DONE. Add new ids in both places.
+
+## Container installs (Docker)
+
+- At installation the user can choose **isolated in Docker**: the whole server (compiler, database, auth- and worldserver) runs in Debian Trixie containers — on Windows that means no Visual Studio build tools and nothing else but Docker Desktop; on Linux nothing but Docker itself. Opt-in only at install (`cli install --docker`); switching an existing server over is not supported.
+- The engine writes its container files into `<server>/Docker/` (`Dockerfile`, `compose.yml`, `db-bootstrap.sh`) and marks the server with `.afk-container`. The app detects both (`Install.InDocker`, plus the compose project name from the marker) and appends `-Container Docker` to every engine call itself.
+- The compose file binds the whole server folder at `/srv` (relative paths only — on Windows too), so the source, build and configs all live at the same `/srv/...` paths in build and runtime containers. New compose services, ports and bind paths belong in `Write-ContainerFiles`.
+- The engine drives the containers; the "inner" engine run is the same script in a `docker run` (not a `docker build` — its output must keep streaming `##AC|` lines). It runs on the compose network: the database is host `db` (`AFK_DB_HOST`), and MySQL for the build comes from the image (`AFK_MYSQL_ROOT=/opt/afk/mysql`), because Debian has no true MySQL 8 package.
+- A fresh MySQL only allows `root@localhost`: `db-bootstrap.sh` gives the accounts their rights through a one-time socket-level start of the database inside its own container. Changing that logic means keeping its double password check (fresh install has an empty root password, later runs the chosen one).
+- Windows keeps the Windows portable MySQL in `DB/mysql` for the app's client tools (`Install-MySql` on the host), while the image bakes the Linux one (the inner engine's `Install-MySql` skips itself). Map data runs the extractors inside the image (game folder bind-mounted per step) — a Windows host cannot run the Linux tools outside Docker.
+- Image tags carry the Dockerfile hash plus `$env:AC_ENGINE_VERSION` (the app passes `Product.Version`), so a stale cached image never hides a changed recipe. `ServerControl` reports and steers the services through `ServerProc` (host process or container handle) because under Docker Desktop the container processes are not visible on the host.
 
 ## Versions and releases
 
 - Version lives in two places — `Product.Version` in `src/Core.cs` and `<Version>` in `app/AfkRealm.csproj` — keep them identical.
-- Release flow: bump both, add a top `## X.Y.Z` entry to `CHANGELOG.md`, add a top user-facing section to `RELEASE_NOTES.md` (CI uses the whole file as the GitHub release body), commit as `Release X.Y.Z: <summary>`, push tag `vX.Y.Z`; CI builds and publishes. A `-` in the tag marks a prerelease (for the same version, a release beats a `-preview`).
+- Release flow: bump both, add a top `## X.Y.Z` entry to `CHANGELOG.md`, add a top user-facing section to `RELEASE_NOTES.md` (CI uses the whole file as the GitHub release body), commit as `Release X.Y.Z: <summary>`, push tag `vX.Y.Z`; CI builds and publishes. A `-` in the tag marks a prerelease (for the same version, a release beats a `-preview`). The repo has no `Unreleased` section — features accumulate in the working tree and the CHANGELOG entry is written together with the release bumps.
 - Keep release asset names: the updater downloads `AFK-Realm.exe`, `AFK-Realm-linux-x64` or `AFK-Realm-linux-arm64`; `AFK-Realm-web.exe` (same file) updates 1.1.0–1.1.5 web builds. Tag builds also attach `assets/coa64-native/CoA64.zip` (a missing file fails the job).
 - CI fails if the win-x64 `AFK-Realm.exe` reaches 50 MiB (52,428,800 bytes): classic exes refuse larger self-updates. Watch size when adding embedded assets.
 
