@@ -2967,13 +2967,17 @@ function Copy-EngineIntoBuilder {
 # server folder and the database as network host "db". The journal and password come along.
 function Invoke-ContainerEngine([string]$Action) {
     Copy-EngineIntoBuilder
+    # One container of the build at a time: if a run was cancelled before it, its container still
+    # finishes; taking it out beforehand keeps the computer from compiling twice.
+    $stragglers = Get-ProgramOutput 'docker' @('ps', '-q', '--filter', ('label=afk-build-container=' + $ContainerProject))
+    foreach ($id in ($stragglers -split "`n")) { if ($id.Trim()) { [void](Invoke-Program 'docker' @('rm', '-f', $id.Trim()) -AllowFailure) } }
     $envFile = Join-Path ([IO.Path]::GetTempPath()) ('afk-env-' + [guid]::NewGuid().ToString('N') + '.txt')
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('AC_DB_PASSWORD=' + $password)
     if ($env:AC_REALM_NAME) { $lines.Add('AC_REALM_NAME=' + $env:AC_REALM_NAME) }
     if ($env:AC_ENGINE_VERSION) { $lines.Add('AC_ENGINE_VERSION=' + $env:AC_ENGINE_VERSION) }
     [IO.File]::WriteAllLines($envFile, $lines)
-    $args_ = @('run', '--rm', '--network', $ContainerNetwork, '--user', $ContainerUser,
+    $args_ = @('run', '--rm', '--label', ('afk-build-container=' + $ContainerProject), '--network', $ContainerNetwork, '--user', $ContainerUser,
         '--env-file', $envFile,
         '-v', ($InstallRoot + ':/srv'), '-w', '/srv',
         '-e', 'HOME=/tmp',
