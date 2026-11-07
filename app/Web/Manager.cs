@@ -119,7 +119,7 @@ namespace CoAInstaller.Web
                 db = ctl.Db != null; auth = ctl.Auth != null;
                 var worldProcess = ctl.World;
                 world = worldProcess != null;
-                if (world) { try { worldStart = worldProcess.StartTime; worldMemory = Math.Max(worldProcess.PrivateMemorySize64, worldProcess.WorkingSet64); } catch { } }
+                if (world) { try { worldStart = worldProcess.StartTime; worldMemory = worldProcess.Memory; } catch { } }
                 worldReady = world && Net.PortOpen(ctl.WorldPort);
                 maps = inst.HasMapData; dbc = inst.HasClientDbc;
             }
@@ -374,7 +374,7 @@ namespace CoAInstaller.Web
                     ctl.StopAll(st, false);
                     ctl.StartDatabase(st); ctl.StartAuth(st);
                     try { AdminLink.Prepare(inst); } catch { }
-                    Process world = ctl.StartWorld(st);
+                    var world = ctl.StartWorld(st);
                     st(L.T("the worldserver is loading."));
                     var done = new ManualResetEvent(false);
                     ctl.WatchWorld(world, (ready, why) => { if (!ready) problem = why; done.Set(); });

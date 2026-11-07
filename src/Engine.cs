@@ -37,15 +37,22 @@ namespace CoAInstaller
             new Phase("finish",    L.T("Configuration and final checks"), 3),
         };
 
+        /// <summary>The container steps of a container install: Docker check and image build.</summary>
+        static readonly Phase[] ContainerPhases =
+        {
+            new Phase("docker",    L.T("Check Docker"), 1),
+            new Phase("image",     L.T("Prepare the container images (Debian Trixie)"), 5),
+        };
+
         /// <summary>The steps shown for a mode. Updates back up the server right after the update check.</summary>
-        public static Phase[] For(string mode)
+        public static Phase[] For(string mode, bool inDocker = false)
         {
             if (mode == "Backup") return new[] { new Phase("backup", L.T("Back up the server"), 1) };
             if (mode == "RestoreParts") return new[] { new Phase("restore", L.T("Restore the databases"), 3), new Phase("files", L.T("Restore the settings"), 1), new Phase("finish", L.T("Bring the databases up to date"), 3) };
             if (mode == "Restore") return new[] { new Phase("restore", L.T("Restore the databases"), 4), new Phase("files", L.T("Restore the server programs and versions"), 1) };
             if (mode == "Modules")
             {
-                return new[]
+                var list = new List<Phase>
                 {
                     new Phase("tools",     L.T("Check tools (Git, CMake)"), 2),
                     new Phase("backup",    L.T("Back up the current server"), 6),
@@ -59,18 +66,27 @@ namespace CoAInstaller
                     new Phase("world",     L.T("World data check"), 1),
                     new Phase("finish",    L.T("Database: apply and record new modules, final checks"), 8),
                 };
+                if (inDocker) { list.InsertRange(1, ContainerPhases); }
+                return list.ToArray();
             }
             if (mode == "Update" || mode == "Rebuild")
             {
                 var list = InstallPhases.ToList();
                 list.Insert(1, new Phase("backup", L.T("Back up the current server"), 4));
+                if (inDocker) { list.InsertRange(1, ContainerPhases); }
+                return list.ToArray();
+            }
+            if (inDocker)
+            {
+                var list = InstallPhases.ToList();
+                list.InsertRange(1, ContainerPhases);
                 return list.ToArray();
             }
             return InstallPhases;
         }
 
         public readonly Phase[] Phases;
-        public EngineRunner(string mode) { Phases = For(mode); }
+        public EngineRunner(string mode, bool inDocker = false) { Phases = For(mode, inDocker); }
 
         // Events are raised on the reader thread; the UI marshals them.
         public event Action<int> PhaseStarted;            // index into Phases
@@ -137,6 +153,8 @@ namespace CoAInstaller
             };
             psi.EnvironmentVariables["AC_DB_PASSWORD"] = dbPassword ?? "";
             psi.EnvironmentVariables["AC_REALM_NAME"] = RealmName ?? "";
+            // The images of a container install carry this version tag (rebuild with a new engine).
+            psi.EnvironmentVariables["AC_ENGINE_VERSION"] = Product.Version;
             proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
             proc.OutputDataReceived += (s, e) => { if (e.Data != null) Handle(e.Data); };
             proc.ErrorDataReceived += (s, e) => { if (e.Data != null) Handle(e.Data); };

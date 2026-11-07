@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -844,7 +844,7 @@ namespace CoAInstaller
                     db = ctl.Db != null; auth = ctl.Auth != null;
                     var worldProcess = ctl.World;
                     world = worldProcess != null;
-                    if (world) { try { worldStart = worldProcess.StartTime; worldMemory = Math.Max(worldProcess.PrivateMemorySize64, worldProcess.WorkingSet64); } catch { } }
+                    if (world) { try { worldStart = worldProcess.StartTime; worldMemory = worldProcess.Memory; } catch { } }
                     worldReady = world && Net.PortOpen(ctl.WorldPort);
                     maps = inst.HasMapData; dbc = inst.HasClientDbc;
                 }
@@ -885,7 +885,7 @@ namespace CoAInstaller
             if (!inst.HasMapData && !Ui.Confirm(this, L.T("Map data is missing. The worldserver will not run properly without it.\n\nStart anyway?"))) return;
             if (inst.HasMapData && !inst.HasClientDbc)
             { Ui.Error(this, L.T("The CoA DBC tables are missing, so the worldserver would stop right away.\n\nOpen \"Create map data\", choose your CoA game folder and tick \"Only refresh the CoA DBC tables\".")); return; }
-            Process world = null;
+            ServerProc world = null;
             Main.RunBusy(busy, st =>
                 {
                     ctl.RestoreAfterBotReset(); ctl.StartDatabase(st); ctl.StartAuth(st);
@@ -1181,7 +1181,7 @@ namespace CoAInstaller
                     ctl.StopAll(st, false);
                     ctl.StartDatabase(st); ctl.StartAuth(st);
                     try { AdminLink.Prepare(inst); } catch { }
-                    Process world = ctl.StartWorld(st);
+                    var world = ctl.StartWorld(st);
                     st(L.T("the worldserver is loading."));
                     var done = new System.Threading.ManualResetEvent(false);
                     ctl.WatchWorld(world, (ready, why) => { if (!ready) problem = why; done.Set(); });

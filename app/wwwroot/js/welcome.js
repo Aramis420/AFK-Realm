@@ -1,10 +1,10 @@
-// The first pages: welcome, folder, server name, database password, summary - then the installation runs.
+﻿// The first pages: welcome, folder, server name, database password, summary - then the installation runs.
 import { h, T, F, meta, post, get, replace, lines, debounce, state } from './core.js';
 import { primary, secondary, ghost, input, password, check, field, choose, alert, confirm } from './ui.js';
 import { icon } from './icons.js';
 import { languageMenu, themeMenu, show } from './app.js';
 
-const wiz = { path: '', name: 'AzerothCore', password: '', password2: '', installed: false, shortcut: true };
+const wiz = { path: '', name: 'AzerothCore', password: '', password2: '', installed: false, shortcut: true, docker: false };
 
 export function header() {
   const lang = h('button', { type: 'button', title: T('Language') }, icon('language'), (meta.languages.find(l => l.code === meta.language) || { name: 'English' }).name);
@@ -25,6 +25,7 @@ function footer(...buttons) { return h('footer', {}, ...buttons); }
 export function welcome(step) {
   if (step === 'folder') return folderPage();
   if (step === 'name') return namePage();
+  if (step === 'container') return containerPage();
   if (step === 'password') return passwordPage();
   if (step === 'summary') return summaryPage();
   const tile = (title, text, ic, onclick) => h('button.tile', { type: 'button', onclick }, h('span.ic', {}, icon(ic)), h('span', {}, h('b', {}, title), h('span', {}, text)));
@@ -92,6 +93,35 @@ function folderPage() {
     })));
 }
 
+// How the server should run. The second option puts everything - compiler, database, auth- and
+// worldserver - into Debian Trixie containers (Docker). Works the same on Windows and Linux.
+function containerPage() {
+  const statusLine = h('div.hint.pre');
+  const refresh = async () => {
+    try {
+      const r = await get('/api/docker/status');
+      if (r.installed && r.running) {
+        statusLine.className = 'hint';
+        statusLine.textContent = T('Docker is running here. The server would live in its containers.');
+      } else {
+        statusLine.className = 'hint bad';
+        statusLine.textContent = meta.windows
+          ? T('Docker is missing here. With "Docker Desktop" this computer would get a small Debian Linux under its Windows: docker.com/products/docker-desktop. Without it, please run the server normally.')
+          : T('Docker is missing here. On Linux: install Docker and Compose (e.g. with one command: sudo apt install docker.io docker-compose-v2). Without it, please run the server normally.');
+      }
+    } catch (e) { statusLine.textContent = e.message; }
+  };
+  refresh();
+  const tile = (ic, title, text, on) => h('button.tile', { type: 'button', onclick: on }, h('span.ic', {}, icon(ic)), h('span', {}, h('b', {}, title), h('span', {}, text)));
+  const normal = tile('server', T('Normally on this computer'), T('The usual way: everything runs here. Nothing extra to install.'), () => { wiz.docker = false; show('welcome', 'container'); });
+  const docker = tile('folder', T('Isolated in Docker'), T('Everything runs in Linux containers on Debian Trixie. Needs Docker; Windows needs no Visual Studio then.'), () => { wiz.docker = true; show('welcome', 'container'); });
+  return page(T('How should the server run?'),
+    h('p', {}, T('You can change this later only by installing again. Choose what suits this computer.')),
+    h('div', {}, normal, docker),
+    statusLine,
+    footer(secondary(T('Back'), () => show('welcome', 'name')), primary(T('Next'), () => show('welcome', 'password'))));
+}
+
 function namePage() {
   const name = input(wiz.name, { maxLength: 32, style: { width: '300px' } });
   name.addEventListener('input', () => { wiz.name = name.value; });
@@ -116,7 +146,7 @@ function passwordPage() {
     h('p', {}, F('The server gets its own private MySQL database. Choose a password for it. You will not need it day to day; {0} keeps it in the server settings.', meta.product)),
     field(T('Password'), p1), field(T('Repeat'), p2), showIt,
     h('p.hint', {}, T('At least 10 characters. Not allowed: semicolon ; quote " and backslash \\ (AzerothCore cannot handle them in its configuration).')),
-    footer(secondary(T('Back'), () => show('welcome', wiz.installed ? 'folder' : 'name')), primary(T('Next'), () => {
+    footer(secondary(T('Back'), () => show('welcome', wiz.installed ? 'folder' : 'container')), primary(T('Next'), () => {
       const a = p1.value, b = p2.value;
       if (a.length < 10) return alert(T('The password needs at least 10 characters.'));
       if (/[;"\\\r\n]/.test(a)) return alert(T('Please do not use a semicolon, quote or backslash.'));
@@ -125,9 +155,17 @@ function passwordPage() {
     })));
 }
 
-const phaseTitles = () => meta.windows
-  ? [T('Check tools (Git, CMake)'), T('Visual Studio C++ Build Tools'), T('Libraries (OpenSSL, Boost)'), T('Portable MySQL database'), T('Download the server source code'), T('Prepare the build (CMake)'), T('Compile the server'), T('Set up the database'), T('Import the CoA world data'), T('Configuration and final checks')]
-  : [T('Check tools (Git, CMake)'), T('Compiler and libraries'), T('Portable MySQL database'), T('Download the server source code'), T('Prepare the build (CMake)'), T('Compile the server'), T('Set up the database'), T('Import the CoA world data'), T('Configuration and final checks')];
+const phaseTitles = () => {
+  const steps = [T('Check tools (Git, CMake)')];
+  if (wiz.docker) {
+    steps.push(T('Check Docker'), T('Prepare the container images (Debian Trixie)'), T('Compiler and libraries (in the container)'));
+  } else {
+    steps.push(meta.windows ? T('Visual Studio C++ Build Tools') : T('Compiler and libraries'));
+  }
+  steps.push(T('Portable MySQL database'), T('Download the server source code'), T('Prepare the build (CMake)'), T('Compile the server'),
+    T('Set up the database'), T('Import the CoA world data'), T('Configuration and final checks'));
+  return steps;
+};
 
 function summaryPage() {
   const shortcut = check(meta.windows ? F('Create a "{0}" shortcut on the desktop', 'AFK Realm') : F('Add "{0}" to the application menu', 'AFK Realm'), wiz.shortcut, v => wiz.shortcut = v);
@@ -136,14 +174,16 @@ function summaryPage() {
     h('p', {}, T('Target:') + ' ', h('span.mono', {}, wiz.path), wiz.installed ? null : [h('br'), T('Server name:') + ' ' + wiz.name]),
     h('h3', {}, T('What happens now')),
     h('ul', {}, phaseTitles().map(t => h('li', {}, t))),
-    h('p.hint', {}, meta.windows
-      ? T('If Visual Studio is missing, its installer window opens along the way. That is normal; please do not close it. Compiling puts a heavy load on your PC. Close games and other large programs if you can.')
-      : T('If build tools of your distribution are missing, AFK Realm stops and shows the one command that installs them (it needs sudo once). Compiling puts a heavy load on your PC.')),
+    wiz.docker
+      ? h('p.hint', {}, T('The build runs inside Linux containers of Docker. Compiling puts a heavy load on your PC; keep Docker running meanwhile. The first images download a few GB once and keep being reused afterwards.'))
+      : h('p.hint', {}, meta.windows
+        ? T('If Visual Studio is missing, its installer window opens along the way. That is normal; please do not close it. Compiling puts a heavy load on your PC. Close games and other large programs if you can.')
+        : T('If build tools of your distribution are missing, AFK Realm stops and shows the one command that installs them (it needs sudo once). Compiling puts a heavy load on your PC.')),
     shortcut, understood,
     footer(secondary(T('Back'), () => show('welcome', 'password')), primary(T('Install'), async () => {
       if (!understood.checked) return alert(T('Please confirm that you have the time.'));
       try {
-        const job = await post('/api/setup/install', { path: wiz.path, name: wiz.name, password: wiz.password, password2: wiz.password2, shortcut: wiz.shortcut });
+        const job = await post('/api/setup/install', { path: wiz.path, name: wiz.name, password: wiz.password, password2: wiz.password2, shortcut: wiz.shortcut, docker: wiz.docker });
         state.job = job;
         show('progress');
       } catch (e) { alert(e.message); }

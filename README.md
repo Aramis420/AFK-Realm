@@ -28,8 +28,8 @@ Pre-built repacks go stale quickly. Building from source keeps you on the latest
 ## Features
 
 - **In your language**: English, Deutsch, Français, Español, Português (Brasil), Русский and 简体中文, chosen from Windows or with one click; more languages can be added as a file ([how](docs/MANUAL.md#15-languages))
-- **Guided installation**: pick a folder and a database password, then click *Install*
-- **Automatic dependencies**: Git, CMake, Visual Studio 2022 C++ Build Tools, OpenSSL 3, Boost 1.87, portable MySQL 8.4, Python and mpqcli, with checksums verified
+- **Guided installation**: pick a folder and a database password, then click *Install*; there you also choose whether the whole server (compiler, database, auth- and worldserver) runs **normally on this computer or isolated in Docker** (containers built on Debian Trixie — on Windows that needs no Visual Studio and nothing else installed but Docker Desktop, on Linux nothing but Docker itself)
+- **Automatic dependencies**: Git, CMake, Visual Studio 2022 C++ Build Tools, OpenSSL 3, Boost 1.87, portable MySQL 8.4, Python and mpqcli, with checksums verified (in the Docker mode the build tools and MySQL come from the container images instead)
 - **Always current**: every installation builds the newest CoA core and Playerbots
 - **Clear progress**: every step, download percentages, compiled files and imported world tables, plus an optional live log
 - **Databases ready before the first start**: imports the CoA world package, creates the auth and character databases and applies all SQL updates, and repairs databases whose setup was interrupted
@@ -112,6 +112,18 @@ Sources used:
 | Core | [Conquest-of-AzerothCore/azerothcore-wotlk-coa](https://github.com/Conquest-of-AzerothCore/azerothcore-wotlk-coa) | `main` |
 | Playerbots | [Zyth45/mod-playerbots](https://github.com/Zyth45/mod-playerbots) | `coa` |
 | MPQ reader | [TheGrayDot/mpqcli](https://github.com/TheGrayDot/mpqcli) | release v0.9.9 |
+
+### The server in Docker
+
+At the start of the installation, before the database password, the wizard asks how the server should run. The default is *normally on this computer*: everything is built and runs here, exactly as described above. The other choice is **isolated in Docker**: the compiler, the database, authserver and worldserver all live in Linux containers built on **Debian 13 (Trixie)** slim — on Windows this means no Visual Studio installation (the compiler is in the container), and on Linux nothing of the distribution's build tools is needed either.
+
+In that mode the engine drives the containers: it verifies Docker (`docker`, with its Compose extension), writes `Dockerfile` and `compose.yml` under the server's `Docker\` folder, builds two images (one to compile, one to run) and then runs itself inside them for the whole build. The running services bind-mount the server folder, so the folder layout above stays the same and backups, the database editor and every other part of AFK Realm keep working unchanged; the app starts and stops the containers (`db`, `auth`, `world` with the published ports 3307/TCP-127.0.0.1, 3724, 8085 and the SOAP port 7878). Requirements: Docker Desktop with WSL2 on Windows, or Docker with the Compose extension on Linux; a container install can be chosen only at installation — switching an existing server over is not supported yet. The engine run can also be driven by hand:
+
+```powershell
+# unattended container install (Docker must be running)
+$env:AC_DB_PASSWORD = '...'
+pwsh engine\engine.ps1 -InstallRoot C:\CoA-Server -NonInteractive -Mode Install -Container Docker
+```
 
 Every installation and rebuild uses the newest commits of the CoA core and Playerbots; *Update* checks for newer ones later. The exact revisions built are recorded in `Dependencies\revisions.txt` and in the install log.
 

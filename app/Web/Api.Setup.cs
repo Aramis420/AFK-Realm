@@ -65,12 +65,44 @@ namespace CoAInstaller.Web
                 string mode = a.Str("mode") ?? "Install";
                 if (mode != "Install") mode = "Install";
                 bool shortcut = a.Bool("shortcut", true);
-                return Jobs.RunEngine(inst, mode, password, 3307, null, name, false, job =>
+                bool docker = a.Bool("docker", false);
+                // An existing server keeps its kind of installation: a container server stays in containers.
+                if (installed) docker = new Install(path).InDocker;
+                return Jobs.RunEngine(inst, mode, password, 3307, docker ? "-Container Docker" : null, name, false, job =>
                 {
                     CopySelf(inst, shortcut);
                     Settings.LastInstall = inst.Root;
                     Settings.Remember(inst.Root, name);
                 }).Snapshot();
+            });
+
+            // State of Docker on this computer, for the choice in the setup.
+            Get(app, "/api/docker/status", c =>
+            {
+                bool installed = true, running = true;
+                try
+                {
+                    var psi = new ProcessStartInfo("docker", "version --format ok")
+                    { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+                    using (var p = Process.Start(psi))
+                    {
+                        p.WaitForExit(8000);
+                        installed = p.ExitCode == 0;
+                        running = installed && p.ExitCode == 0;
+                    }
+                    if (running)
+                    {
+                        var info = new ProcessStartInfo("docker", "info --format ok")
+                        { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+                        using (var p2 = Process.Start(info))
+                        {
+                            p2.WaitForExit(15000);
+                            if (p2.ExitCode != 0) running = false;
+                        }
+                    }
+                }
+                catch { installed = false; running = false; }
+                return new { installed, running };
             });
 
             // After an installation (or its retry): the server it was for is opened.

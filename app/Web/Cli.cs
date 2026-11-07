@@ -18,7 +18,7 @@ namespace CoAInstaller.Web
             {
                 Console.WriteLine(Product.Name + " " + Product.Version + " - command line");
                 Console.WriteLine();
-                Console.WriteLine("  cli install --path <folder> --name <server name> [--password <db password>]");
+                Console.WriteLine("  cli install --path <folder> --name <server name> [--password <db password>] [--docker]");
                 Console.WriteLine("  cli status   [--server <folder>]   database, authserver and worldserver");
                 Console.WriteLine("  cli start    [--server <folder>]");
                 Console.WriteLine("  cli stop     [--server <folder>]   saves every player and shuts down cleanly");
@@ -49,7 +49,8 @@ namespace CoAInstaller.Web
                     if (err != null) { Console.Error.WriteLine(err); return 2; }
                     var inst = new Install(path);
                     Settings.LastInstall = inst.Root; Settings.Remember(inst.Root, name);
-                    return Engine(inst, "Install", pw, name);
+                    bool docker = Array.IndexOf(args, "--docker") >= 0;
+                    return Engine(inst, "Install", pw, name, docker ? "-Container Docker" : null);
                 }
                 string root = opt("server") ?? Settings.LastInstall;
                 if (string.IsNullOrEmpty(root) || !new Install(root).IsInstalled) { Console.Error.WriteLine(L.T("No finished server was found in this folder.") + " (" + root + ")"); return 2; }
@@ -120,17 +121,19 @@ namespace CoAInstaller.Web
             return sb.ToString();
         }
 
-        static int Engine(Install inst, string mode, string password, string realm)
+        static int Engine(Install inst, string mode, string password, string realm, string engineArgs = null)
         {
             if (!Os.Windows) EngineRunner.Shell = Pwsh.Ensure(t => Console.WriteLine(t));
-            var runner = new EngineRunner(mode) { RealmName = realm };
+            // continues where it was: the flag keeps a container install inside the containers.
+            if (inst.InDocker) engineArgs = (engineArgs ?? "") + (engineArgs == null ? "" : " ") + "-Container Docker";
+            var runner = new EngineRunner(mode, inst.InDocker) { RealmName = realm };
             var done = new ManualResetEvent(false); bool ok = false; string text = null;
             runner.PhaseStarted += i => Console.WriteLine("== " + runner.Phases[i].Title);
             runner.LogLine += l => Console.WriteLine(l);
             runner.Note += n => Console.WriteLine("* " + n);
             runner.Finished += (o, t) => { ok = o; text = t; done.Set(); };
             Console.CancelKeyPress += (s, e) => { e.Cancel = true; runner.Cancel(); };
-            runner.Start(inst, mode, password, 3307);
+            runner.Start(inst, mode, password, 3307, engineArgs);
             done.WaitOne();
             Console.WriteLine(ok ? (text == "uptodate" ? L.T("Everything is up to date") : "OK") : "ERROR: " + text);
             return ok ? 0 : 1;

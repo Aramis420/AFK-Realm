@@ -30,10 +30,12 @@ AFK Realm is work in progress, so a window may look slightly different from the 
 
 You need:
 
-- Windows 10 or 11 (64-bit) and administrator rights
+- Windows 10 or 11 (64-bit) and administrator rights, or a 64-bit Linux
 - about 40 GB of free disk space
 - an internet connection
 - your own Conquest of Azeroth game client (it is not part of AFK Realm)
+
+If you choose to run the server **in Docker** (a choice on the installation's *How should the server run?* page), you need instead: **Docker Desktop** on Windows (it brings a small Debian Linux under Windows, needs no administrator after its first start) or **Docker** with its Compose extension on Linux. In that mode nothing of the build tools is installed on the computer itself — the compiler, the database and both servers run in containers of Debian Trixie. Everywhere else the normal install needs no extra software; the app shows or starts what is missing.
 
 AFK Realm builds the server from source code. That takes a while and keeps the PC busy; you can leave it running and do something else.
 
@@ -45,12 +47,15 @@ Everything AFK Realm installs goes into the one folder you choose. Nothing is in
 2. Choose **Install a new server**.
 3. Pick a folder, for example `C:\CoA-Server`, on a local drive (120 characters at most). In a longer folder the build works through a short junction (`<drive>\afk\<8 characters>`) that leads to the server's `Dependencies` folder, because Boost's installer and the compiler fail on paths over 260 characters even when Windows' long paths are switched on.
 4. Give the server a **name**. It is what players see in the realm list when they log in; you can change it later (see [Server name](#server-name)).
-5. Set a **database password** (at least 10 characters). You do not need to type it again later, but keep it somewhere.
-6. Read the summary and click **Install**.
+5. Choose on **How should the server run?** whether it lives **normally on this computer** (the usual way) or **isolated in Docker**: in containers of Debian Trixie that hold compiler, database, authserver and worldserver. The page shows whether Docker is ready on this computer and how to get it if not. This choice belongs to the server; to change it later, install again into another folder.
+6. Set a **database password** (at least 10 characters). You do not need to type it again later, but keep it somewhere.
+7. Read the summary and click **Install**.
 
 ![Name your server](screenshots/19-name-your-server.png)
 
 The progress page shows each step. If Visual Studio is missing, its installer window opens along the way; do not close it.
+
+**A container install** shows *Check Docker* and *Prepare the container images* among the steps; the first images download a few GB once and are reused afterwards. Everything else happens as usual (the compiling just runs inside Docker). Start the server later from AFK Realm as always; the app starts and stops the containers for you. Docker must be running for that (AFK Realm starts Docker Desktop for you when it sleeps); the `Docker` folder in the server holds the files (`Dockerfile`, `compose.yml`) and `start-server.sh` / `START-SERVER.cmd` starts all three containers without AFK Realm.
 
 **If a step fails**, the reason is shown. *Try again* continues where it stopped; what is already downloaded or built is kept. If it fails again, send `logs\install.log` with your report.
 
@@ -482,6 +487,7 @@ C:\CoA-Server\
   Server\         authserver, worldserver, configs, Data (map data), server logs
   DB\             the database and its data
   Dependencies\   build tools, source code, build files, client-addons.txt and client-patch.txt (what was put into the game)
+  Docker\         Dockerfile, compose.yml and db-bootstrap.sh (container installs only)
   logs\           install.log, mysql-error.log
   Backups\        the newest three backups
   Builder\        a copy of AFK Realm (the desktop shortcut points here)
@@ -497,6 +503,8 @@ C:\CoA-Server\
 |---|---|
 | A step of the installation fails | Read the message, click *Try again*. If it fails again, report it with `logs\install.log`. |
 | Visual Studio cannot be installed | Restart Windows (a pending restart is the most common cause) and try again. |
+| *Docker is needed, but it is not installed* / *Docker is installed but not running* | Install Docker Desktop (Windows) or Docker plus its Compose extension (Linux, e.g. `sudo apt install docker.io docker-compose-v2`), start it and try again. |
+| In a container install a service does not come up | Look at `logs\mysql-error.log` (database) and at the console of `docker compose -a logs` in the server's `Docker` folder; also try whether the server folder sits on a drive that Docker can share. |
 | The worldserver closes while starting | AFK Realm shows the end of its log. The full log is `Server\Server.log`. |
 | *DataDir does not hold the CoA client DBC set* | *Create map data* → tick *Only refresh the CoA DBC tables*. |
 | Black screen at the realm selection | Run *Check for updates and install*. |

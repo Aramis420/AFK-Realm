@@ -92,8 +92,7 @@ namespace CoAInstaller
     {
         public readonly string Root;
         public Install(string root) { Root = Path.GetFullPath(root.Trim().TrimEnd('\\', '/')); if (Root.Length == 0) Root = "/"; }
-        public string ServerDir { get { return Path.Combine(Root, "Server"); } }
-        /// <summary>Where the server programs are: the Server folder on Windows, Server/bin on Linux (as AzerothCore installs them there).</summary>
+        public string ServerDir { get { return Path.Combine(Root, "Server"); } }        /// <summary>Where the server programs are: the Server folder on Windows, Server/bin on Linux (as AzerothCore installs them there).</summary>
         public string BinDir { get { return Os.Windows ? ServerDir : Path.Combine(ServerDir, "bin"); } }
         public string ConfigDir { get { return Path.Combine(ServerDir, "configs"); } }
         public string DataDir { get { return Path.Combine(ServerDir, "Data"); } }
@@ -113,6 +112,32 @@ namespace CoAInstaller
         public string WorldConf { get { return Path.Combine(ConfigDir, "worldserver.conf"); } }
         public string AuthConf { get { return Path.Combine(ConfigDir, "authserver.conf"); } }
         public string CoaConf { get { return Path.Combine(ConfigDir, "modules", "coa.conf"); } }
+
+        // ---- Container install (Docker) ----
+        // Written by the engine for a server that runs in containers: a marker in the server folder
+        // and the compose project under Docker\.
+        public string DockerDir { get { return Path.Combine(Root, "Docker"); } }
+        public string ComposeFile { get { return Path.Combine(DockerDir, "compose.yml"); } }
+        public string MarkerFile { get { return Path.Combine(Root, ".afk-container"); } }
+        /// <summary>The server was installed for containers (the engine wrote the marker and the compose file).</summary>
+        public bool InDocker { get { return File.Exists(MarkerFile) && File.Exists(ComposeFile); } }
+        /// <summary>The name of the compose project (from the marker); "afk" + short hash of the folder.</summary>
+        public string DockerProject
+        {
+            get
+            {
+                try
+                {
+                    foreach (var line in File.ReadAllLines(MarkerFile))
+                    {
+                        int eq = line.IndexOf('=');
+                        if (eq > 0 && line.Substring(0, eq).Trim() == "name") return line.Substring(eq + 1).Trim();
+                    }
+                }
+                catch { }
+                return "";
+            }
+        }
 
         public bool IsInstalled
         {
@@ -172,7 +197,11 @@ namespace CoAInstaller
             if (v == null) throw new InvalidOperationException(L.T("LoginDatabaseInfo was not found in worldserver.conf."));
             var p = v.Split(';');
             if (p.Length < 5) throw new InvalidOperationException(L.T("LoginDatabaseInfo in worldserver.conf is incomplete."));
-            return new DbLogin { Host = p[0], Port = int.Parse(p[1]), User = p[2], Password = p[3] };
+            string host = p[0];
+            // In a container install the configurations name the container ("db"); the app reaches the
+            // database over the published port on this computer.
+            if (inst.InDocker && (host == "db" || host == "mysql")) host = "127.0.0.1";
+            return new DbLogin { Host = host, Port = int.Parse(p[1]), User = p[2], Password = p[3] };
         }
         /// <summary>The setup script gives root the same password as the acore user.</summary>
         public DbLogin AsRoot() { return new DbLogin { Host = Host, Port = Port, User = "root", Password = Password }; }
@@ -477,15 +506,188 @@ namespace CoAInstaller
         }
     }
 
+    /// <summary>
+    /// A running server process: the real one on this computer, or (in a container install) its
+    /// container directed through Docker when the process itself cannot be seen on the host
+    /// (Windows with Docker Desktop). Offers just what the app needs of a process.
+    /// </summary>
+    class ServerProc
+    {
+        public readonly Process P;              // null in container mode (only when the process is on the host)
+        readonly DateTime started;              // container mode: the start of the container
+        public readonly string Container;       // the service without install: "db", "auth" or "world"
+
+        public ServerProc(Process p) { P = p; Container = null; }
+        public ServerProc(string service, DateTime? startedAt)
+        {
+            P = null; Container = service; started = startedAt ?? DateTime.MinValue;
+        }
+        public DateTime StartTime
+        {
+            get
+            {
+                try { if (P != null) return P.StartTime; } catch { }
+                return started;
+            }
+        }
+        public long Memory
+        {
+            get
+            {
+                try { if (P != null) return Math.Max(P.PrivateMemorySize64, P.WorkingSet64); } catch { }
+                return 0;                       // in containers the memory is not measurable in this simply way
+            }
+        }
+        public string Service { get { return Container; } }
+    }
+
     /// <summary>Starts, stops and reports the three server processes of one installation.</summary>
     class ServerControl
     {
         readonly Install inst;
         public ServerControl(Install i) { inst = i; }
 
+        public bool InDocker { get { return inst.InDocker; } }
+        public string DockerProject { get { return inst.DockerProject; } }
+        public string ComposeFile { get { return inst.ComposeFile; } }
+
         public int DbPort { get { return Conf.GetInt(inst.MyIni, "port", 3307); } }
         public int AuthPort { get { return Conf.GetInt(inst.AuthConf, "RealmServerPort", 3724); } }
         public int WorldPort { get { return Conf.GetInt(inst.WorldConf, "WorldServerPort", 8085); } }
+
+        // ---- Docker (container install) ----
+        // The services show their state by "docker ps" with the labels of the Compose project; on Linux
+        // the processes of the containers also show themselves in the host's list, so their start time and
+        // memory work as usual. Only under Windows (Docker Desktop) is the process itself not there.
+        public static string DockerLine(string arguments)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo("docker", arguments)
+                { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+                using (var p = Process.Start(psi))
+                {
+                    string output = p.StandardOutput.ReadToEnd();
+                    string err = p.StandardError.ReadToEnd();
+                    p.WaitForExit(15000);
+                    if (p.ExitCode != 0) throw new InvalidOperationException((err + output).Trim().Length > 0 ? (err + output).Trim() : L.F("docker ended with code {0}.", p.ExitCode));
+                    return output;
+                }
+            }
+            catch (InvalidOperationException) { throw; }
+            catch (Exception ex) { throw new InvalidOperationException(L.T("Docker could not be started:") + " " + ex.Message); }
+        }
+
+        public static string Docker(string file, string arguments)
+        {
+            return DockerLine("compose -f \"" + file + "\" " + arguments);
+        }
+
+        /// <summary>State of the services of the compose project: service name → "running"/"exited"/... .</summary>
+        public Dictionary<string, string> DockerServices()
+        {
+            var result = new Dictionary<string, string>();
+            string output = DockerLine("ps -a --filter \"label=com.docker.compose.project=" + DockerProject + "\" --format \"{{.State}} {{.Label \\\"com.docker.compose.service\\\"}}\"");
+            foreach (string line in output.Split('\n'))
+            {
+                string t = line.Trim();
+                int sp = t.IndexOf(' ');
+                if (sp > 0) result[t.Substring(sp + 1)] = t.Substring(0, sp);
+            }
+            return result;
+        }
+
+        /// <summary>Starts Docker Desktop on Windows when it sleeps; waits until the daemon answers.</summary>
+        public static void EnsureDockerRunning()
+        {
+            if (Os.Windows)
+            {
+                try
+                {
+                    var PSI = new ProcessStartInfo("docker", "info --format \"{{.ServerVersion}}\"")
+                    { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+                    using (var probe = Process.Start(PSI))
+                    {
+                        probe.WaitForExit(8000);
+                        if (probe.ExitCode == 0) return;
+                    }
+                }
+                catch { }
+                string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Docker", "Docker", "Docker Desktop.exe");
+                if (File.Exists(path))
+                {
+                    try { Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); } catch { }
+                }
+            }
+            int waited = 0;
+            while (waited < 120)
+            {
+                try
+                {
+                    var psi = new ProcessStartInfo("docker", "info --format ok")
+                    { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+                    using (var p = Process.Start(psi))
+                    {
+                        p.WaitForExit(8000);
+                        if (p.ExitCode == 0) return;
+                    }
+                }
+                catch { }
+                Thread.Sleep(4000);
+                waited += 4;
+            }
+        }
+
+        /// <summary>The running docker container of a service as a ServerProc (state and start time over Docker).</summary>
+        public ServerProc DockerProc(string service)
+        {
+            string suffix = service == "db" ? "db" : service == "auth" ? "auth" : "world";
+            DateTime startedAt = DateTime.MinValue;
+            try
+            {
+                string when = DockerLine("inspect --format \"{{.State.StartedAt}}\" " + DockerProject + "-" + suffix + "-1").Trim();
+                var m = Regex.Match(when, @"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)$");
+                if (m.Success)
+                    startedAt = DateTime.Parse(m.Groups[1].Value + m.Groups[3].Value, System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal).ToLocalTime();
+            }
+            catch { }
+            return new ServerProc(service, startedAt);
+        }
+
+        public void StartContainerService(Action<string> status, string service)
+        {
+            EnsureDockerRunning();
+            var states = DockerServices();
+            string state;
+            if (states.TryGetValue(service, out state) && state == "running")
+            {
+                if (service == "db" && !Net.PortOpen(DbPort))
+                    throw new InvalidOperationException(L.F("The database container is running, but port {0} is not reachable.\n\nUsed \"docker compose logs db\" in {1} to find the reason.", DbPort, inst.DockerDir));
+                return;
+            }
+            status(L.F("Starting the {0} container ...", service == "db" ? L.T("database") : service == "auth" ? L.T("authserver") : L.T("worldserver")));
+            Docker(ComposeFile, "up -d --no-recreate " + service);
+            int port = service == "db" ? DbPort : service == "auth" ? AuthPort : WorldPort;
+            for (int i = 0; i < 120; i++)
+            {
+                if (Net.PortOpen(port)) return;
+                var now = DockerServices();
+                string nowState;
+                if (!now.TryGetValue(service, out nowState))
+                    throw new InvalidOperationException(L.F("The {0} container stopped while starting. The log: {1}\\logs\\...", service, service == "db" ? "mysql-error" : service == "auth" ? "Auth.log" : "Server.log"));
+                if (nowState != "running" && i > 10)
+                    throw new InvalidOperationException(L.F("The {0} container stopped while starting (state {1}). The logs live in the logs\\ folder.", service, nowState));
+                Thread.Sleep(500);
+            }
+            throw new InvalidOperationException(L.F("The {0} container did not become ready in time.", service));
+        }
+        public void StopContainerService(string service)
+        {
+            Docker(ComposeFile, "stop -t " + (service == "world" ? 90 : service == "db" ? 60 : 20) + " " + service);
+        }
+
+        // ---- Not a container install: the services are processes on this computer ----
 
         public Process Find(string exeName, string folder)
         {
@@ -500,12 +702,48 @@ namespace CoAInstaller
             }
             return null;
         }
-        public Process Db { get { return Find(Os.Exe("mysqld"), Path.Combine(inst.DbDir, "mysql")); } }
-        public Process Auth { get { return Find(Os.Exe("authserver"), inst.ServerDir); } }
-        public Process World { get { return Find(Os.Exe("worldserver"), inst.ServerDir); } }
+
+        ServerProc Wrap(Process p) { return p == null ? null : new ServerProc(p); }
+
+        // The three services; in a container install they are directed through Docker. The state of
+        // the containers is kept fresh here (the manager loop asks every two seconds).
+        Dictionary<string, string> servicesCache; DateTime servicesTime;
+        Dictionary<string, string> CachedServices
+        {
+            get
+            {
+                if (servicesCache == null || (DateTime.UtcNow - servicesTime).TotalSeconds > 1.0)
+                {
+                    servicesCache = DockerServices();
+                    servicesTime = DateTime.UtcNow;
+                }
+                return servicesCache;
+            }
+        }
+        void InvalidateServices() { servicesCache = null; }
+
+        public ServerProc Db { get { return InDocker ? DockerCached("db") : Wrap(Find(Os.Exe("mysqld"), Path.Combine(inst.DbDir, "mysql"))); } }
+        public ServerProc Auth { get { return InDocker ? DockerCached("auth") : Wrap(Find(Os.Exe("authserver"), inst.ServerDir)); } }
+        public ServerProc World { get { return InDocker ? DockerCached("world") : Wrap(Find(Os.Exe("worldserver"), inst.ServerDir)); } }
+
+        ServerProc DockerCached(string service)
+        {
+            string state;
+            if (!CachedServices.TryGetValue(service, out state) || state != "running") return null;
+            return DockerProc(service);
+        }
 
         public void StartDatabase(Action<string> status)
         {
+            if (InDocker)
+            {
+                if (Db != null) { return; }
+                if (Net.PortOpen(DbPort))
+                    throw new InvalidOperationException(L.F("Port {0} is already in use. Is another database (for example another repack) still running? Stop it first.", DbPort));
+                StartContainerService(status, "db");
+                InvalidateServices();
+                return;
+            }
             if (Db != null) return;
             if (Net.PortOpen(DbPort))
                 throw new InvalidOperationException(L.F("Port {0} is already in use. Is another database (for example another repack) still running? Stop it first.", DbPort));
@@ -524,6 +762,14 @@ namespace CoAInstaller
         }
         public void StartAuth(Action<string> status)
         {
+            if (InDocker)
+            {
+                if (Auth != null) { return; }
+                if (World == null) ResetRealmFlags();
+                StartContainerService(status, "auth");
+                InvalidateServices();
+                return;
+            }
             if (Auth != null) return;
             if (World == null) ResetRealmFlags();
             status(L.T("Starting the authserver ..."));
@@ -534,19 +780,25 @@ namespace CoAInstaller
         /// Starts the worldserver and returns once it is loading. Loading takes minutes; the caller
         /// watches it with <see cref="WatchWorld"/> instead of blocking the window meanwhile.
         /// </summary>
-        public Process StartWorld(Action<string> status)
+        public ServerProc StartWorld(Action<string> status)
         {
             var running = World;
             if (running != null) return running;
+            if (InDocker)
+            {
+                StartContainerService(status, "world");
+                InvalidateServices();
+                return World;
+            }
             status(L.T("Starting the worldserver ..."));
             var p = StartConsole(inst.WorldExe, inst.WorldConf);
             // Configuration and database problems end the process within seconds.
             for (int i = 0; i < 30; i++)
             {
-                if (Net.PortOpen(WorldPort)) return p;
+                if (Net.PortOpen(WorldPort)) return Wrap(p);
                 if (p != null && p.WaitForExit(500)) throw WorldStopped();
             }
-            return p;
+            return Wrap(p);
         }
         Exception WorldStopped()
         {
@@ -566,8 +818,9 @@ namespace CoAInstaller
             catch { return ""; }
         }
         /// <summary>Waits in the background until the worldserver accepts players (true) or closes first (false, with the reason).</summary>
-        public void WatchWorld(Process p, Action<bool, string> finished)
+        public void WatchWorld(ServerProc world, Action<bool, string> finished)
         {
+            Process p = world == null ? null : world.P;
             new Thread(() =>
             {
                 try
@@ -575,7 +828,22 @@ namespace CoAInstaller
                     while (true)
                     {
                         if (Net.PortOpen(WorldPort)) { finished(true, null); return; }
-                        if (p == null || p.WaitForExit(2000)) { finished(false, WorldStopped().Message); return; }
+                        if (p == null)
+                        {
+                            if (world != null && world.Container != null)
+                            {
+                                // In the container the state comes from Docker; the worldserver that is
+                                // no longer there means a stop while loading.
+                                Thread.Sleep(2000);
+                                string state;
+                                if (!CachedServices.TryGetValue("world", out state) || state != "running")
+                                { finished(false, WorldStopped().Message); return; }
+                                continue;
+                            }
+                            finished(false, WorldStopped().Message);
+                            return;
+                        }
+                        if (p.WaitForExit(2000)) { finished(false, WorldStopped().Message); return; }
                     }
                 }
                 catch (Exception ex) { finished(false, ex.Message); }
@@ -594,6 +862,17 @@ namespace CoAInstaller
 
         Process StartConsole(string exe, string conf)
         {
+            if (InDocker)
+            {
+                // The container variant: a one-off run of the worldserver from its image gets the same
+                // handling as a usual process here ("docker compose run" passes signals on, and goes
+                // away when the server stops).
+                var oneOff = new ProcessStartInfo("docker", string.Format(
+                    "compose -f \"{0}\" run --rm --entrypoint \"\" world /srv/Server/bin/worldserver --config /srv/Server/configs/worldserver.conf",
+                    inst.ComposeFile))
+                { UseShellExecute = false, CreateNoWindow = true };
+                return Process.Start(oneOff);
+            }
             if (!Os.Windows)
             {
                 // Linux: in the background, in a session of its own. The worldserver would stop at the end of its
@@ -755,16 +1034,54 @@ namespace CoAInstaller
         }
         public void StopAll(Action<string> status, bool includeDatabase)
         {
+            if (InDocker)
+            {
+                Dictionary<string, string> s = CachedServices;
+                string state;
+                s.TryGetValue("world", out string worldState);
+                s.TryGetValue("auth", out string authState);
+                s.TryGetValue("db", out string dbState);
+                InvalidateServices();
+                if (worldState == "running")
+                {
+                    status(L.T("Worldserver is saving and shutting down ..."));
+                    StopContainerService("world");
+                }
+                if (authState == "running")
+                {
+                    status(L.T("Stopping the authserver ..."));
+                    StopContainerService("auth");
+                }
+                if (includeDatabase && dbState == "running")
+                {
+                    status(L.T("Stopping the database safely ..."));
+                    if (MySql.Shutdown(inst, DbLogin.FromConfig(inst).AsRoot()))
+                    {
+                        for (int i = 0; i < 120; i++)
+                        {
+                            var now = DockerServices(); string nowState;
+                            now.TryGetValue("db", out nowState);
+                            if (nowState != "running") { InvalidateServices(); return; }
+                            Thread.Sleep(500);
+                        }
+                    }
+                    // mysqladmin would not answer: stop it the direct way (Docker asks first with SIGTERM).
+                    try { Docker(ComposeFile, "stop -t 60 db"); } catch { }
+                }
+                InvalidateServices();
+                status(L.T("Server is stopped."));
+                return;
+            }
             var w = World;
             if (w != null)
             {
                 status(L.T("Worldserver is saving and shutting down ..."));
-                if (!StopConsoleProcess(w, 180))
+                if (!StopConsoleProcess(w.P, 180))
                 {
                     // Second way: ask it through the game master connection.
                     bool asked = false;
                     try { AdminLink.Run(inst, "server shutdown 1"); asked = true; } catch { }
-                    if (!asked || !w.WaitForExit(180000))
+                    if (!asked || w.P.WaitForExit(180000) == false)
                         throw new InvalidOperationException(L.T("The worldserver did not respond. Type \"server shutdown 1\" in the console of the game master tools, then try again."));
                 }
             }
@@ -772,7 +1089,7 @@ namespace CoAInstaller
             if (a != null)
             {
                 status(L.T("Stopping the authserver ..."));
-                if (!StopConsoleProcess(a, 20)) { try { a.Kill(); } catch { } }
+                if (!StopConsoleProcess(a.P, 20)) { try { a.P.Kill(); } catch { } }
             }
             if (includeDatabase && Db != null)
             {

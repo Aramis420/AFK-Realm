@@ -54,6 +54,7 @@ namespace CoAInstaller.Web
                 string pw;
                 try { pw = DbLogin.FromConfig(inst).Password; } catch (Exception ex) { throw new UserError(ex.Message); }
                 string args = EngineArgs(mode, a);
+                if (inst.InDocker) args += " -Container Docker";
                 LastArgs = args;
                 bool stop = mode != "Backup";
                 return Jobs.RunEngine(inst, mode, pw, Ctl.DbPort, args, null, stop).Snapshot();
