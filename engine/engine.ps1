@@ -2896,23 +2896,42 @@ function Write-ContainerBootstrap {
 
 # Writes the configuration again (paths of the container), translates a new database directory and
 # starts the database container. The inner engine waits for the port before its database steps.
+# Inside the running database container: may the accounts of this server connect at all
+# (it says no when the first rights of the containers are missing or the password changed)?
+function Test-ContainerLogin {
+    $out = Get-ProgramOutput 'docker' @('compose', '-f', $Paths.Compose, 'exec', '-T', '-e', ('MYSQL_PWD=' + $password),
+        'db', '/opt/afk/mysql/bin/mysql', '-h127.0.0.1', '-uroot', '--batch', '-e', 'SELECT 1')
+    return ($null -ne $out)
+}
+
+# Gives the accounts their first rights (once, at a one-time start of the database itself) and
+# repairs it when the database is running but rejects the accounts (for example on a changed password).
 function Start-ContainerDatabase {
     Write-MySqlConfig
     Write-ContainerBootstrap
-    if (-not (Test-Path (Join-Path $Paths.DbData 'mysql'))) {
+    $fresh = -not (Test-Path (Join-Path $Paths.DbData 'mysql'))
+    if ($fresh) {
         Write-Log 'Creating a new database directory (inside the container) ...'
         New-Item -ItemType Directory -Force -Path $Paths.DbData | Out-Null
         [void](Invoke-Program 'docker' @('run', '--rm', '--user', $ContainerUser, '-v', ($InstallRoot + ':/srv'), '-w', '/srv',
             '-e', 'HOME=/tmp', $ContainerImageServer,
             '/bin/sh', '-c', 'exec /opt/afk/mysql/bin/mysqld --defaults-file=/srv/DB/my.ini --initialize-insecure --console'))
     }
-    # The first rights of the containers: without them only "root@localhost" works, which no other
-    # container can reach. Runs before the database itself starts in its container.
-    [void](Invoke-Program 'docker' @('run', '--rm', '--user', $ContainerUser, '-v', ($InstallRoot + ':/srv'), '-w', '/srv',
-        '-e', 'HOME=/tmp', '-e', ('AFK_BOOT_PW=' + $password), $ContainerImageServer,
-        '/bin/sh', '/srv/Docker/db-bootstrap.sh'))
     if (-not (Test-ContainerRunning 'db')) {
+        # The first rights of the containers: without them only "root@localhost" works, which no
+        # other container can reach. A one-time start of the database in its own container; the
+        # script is harmless when the rights are already in place (IF NOT EXISTS, the same password).
+        [void](Invoke-Program 'docker' @('run', '--rm', '--user', $ContainerUser, '-v', ($InstallRoot + ':/srv'), '-w', '/srv',
+            '-e', 'HOME=/tmp', '-e', ('AFK_BOOT_PW=' + $password), $ContainerImageServer,
+            '/bin/sh', '/srv/Docker/db-bootstrap.sh'))
         if (Test-Port $DatabasePort) { throw (Tr 'Port {0} is already used by another program (another database or repack?). Stop it or choose another port.' $DatabasePort) }
+        [void](Invoke-Program 'docker' @('compose', '-f', $Paths.Compose, 'up', '-d', 'db'))
+    } elseif (-not (Test-ContainerLogin)) {
+        # The database runs, but rejects the accounts (for example after a change of the password in the app).
+        [void](Invoke-Program 'docker' @('compose', '-f', $Paths.Compose, 'stop', 'db'))
+        [void](Invoke-Program 'docker' @('run', '--rm', '--user', $ContainerUser, '-v', ($InstallRoot + ':/srv'), '-w', '/srv',
+            '-e', 'HOME=/tmp', '-e', ('AFK_BOOT_PW=' + $password), $ContainerImageServer,
+            '/bin/sh', '/srv/Docker/db-bootstrap.sh'))
         [void](Invoke-Program 'docker' @('compose', '-f', $Paths.Compose, 'up', '-d', 'db'))
     }
     $ok = $false
