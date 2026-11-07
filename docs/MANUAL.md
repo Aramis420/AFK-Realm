@@ -83,7 +83,7 @@ Below them are **Start server**, **Stop server**, **Restart server** and **Open 
 
 ### Scheduled restart
 
-A world that has run for many hours can grow slow and use more and more memory. Stopping and starting it gives the memory back. Under **Server → Scheduled restart** AFK Realm does that on its own:
+A world that has run for many hours can grow slow and use more and more memory. Stopping and starting it gives the memory back. Under **Server → Scheduled restart** AFK Realm does that on its own. In a container install on Windows (Docker Desktop) the memory rule cannot read the memory of the worldserver; there the restart follows the hours rule or the daily time instead.
 
 ![Server management with a scheduled restart](screenshots/8-server-management.png)
 
