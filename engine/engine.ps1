@@ -24,6 +24,14 @@
                   (-RemoveModules "<folder name>;..."), rebuild, record or undo
                   their database changes
 
+    -Container Docker puts the whole server (compiler, database, authserver and
+    worldserver) into Debian Trixie containers instead of using this computer.
+    Windows then needs no Visual Studio either. The files live in Docker\ next to
+    the server; the running engine drives them. At the start the engine checks
+    Docker, writes Dockerfile and compose.yml, builds two images and compiles and
+    configures inside them. The AFK Realm app recognizes such a server by
+    .afk-container in its folder and starts and stops the containers itself.
+
     In -NonInteractive mode the database password is read from the environment
     variable AC_DB_PASSWORD and progress is reported as machine-readable lines:
         ##AC|PHASE|<id>|<text>    ##AC|CHANGE|<text>    ##AC|SOURCES|<count>
@@ -35,6 +43,7 @@ param(
     [string]$InstallRoot = '',
     [ValidateRange(1024, 65535)][int]$DatabasePort = 3307,
     [ValidateSet('', 'Install', 'Update', 'Rebuild', 'Setup', 'Backup', 'Restore', 'RestoreParts', 'Modules')][string]$Mode = '',
+    [ValidateSet('', 'Docker')][string]$Container = '',
     [string]$Snapshot = '',
     [string]$Parts = '',
     [string]$AddModules = '',
@@ -54,6 +63,21 @@ $OutputEncoding = New-Object Text.UTF8Encoding($false)
 $OnWindows = [IO.Path]::DirectorySeparatorChar -eq '\'
 # The name of a program file: worldserver.exe on Windows, worldserver on Linux.
 function Exe([string]$Name) { if ($OnWindows) { return "$Name.exe" } else { return $Name } }
+
+# =============================================================================
+#  Container mode - Debian Trixie containers instead of this computer's hardware
+# =============================================================================
+# -Container Docker is set both for the engine that drives the containers (on the computer) and
+# for the engine that runs inside them. AFK_ENGINE_CONTAINER marks the inside one: it sees the
+# same folders but no Docker commands. The outside engine must then first have started the
+# database in its container, so that the inside one can reach it over the network.
+$ContainerEnabled = ($Container -eq 'Docker')
+$IsInnerEngine = ($env:AFK_ENGINE_CONTAINER -eq 'inner')
+# Inside the container the whole server root is mounted at /srv, so all paths of the build and
+# of the runtime configuration agree there and in the running containers later.
+$ContainerRoot = '/srv'
+# The portable MySQL the container images use to run the database and to build the core.
+$ContainerMySqlRoot = '/opt/afk/mysql'
 
 # =============================================================================
 #  Server profile - everything specific to the Conquest of Azeroth project
@@ -93,6 +117,10 @@ $Downloads = @{
     MySqlLinux = @{ Version = '8.4.9'; MinBytes = 40MB
                  Url = 'https://cdn.mysql.com/archives/mysql-8.4/mysql-8.4.9-linux-glibc2.28-x86_64-minimal.tar.xz'
                  Sha256 = '' }
+    # For arm64 (Raspberry Pi, servers): the image of the container build brings MySQL for this architecture;
+    # MySQL 8.4 comes as a minimal tarball only for x86_64, so the larger complete build is used there.
+    MySqlLinuxArm = @{ Version = '8.4.9'; MinBytes = 200MB
+                 Url = 'https://cdn.mysql.com/archives/mysql-8.4/mysql-8.4.9-linux-glibc2.28-aarch64.tar.xz' }
     MpqCliLinux = @{ Version = '0.9.9'; MinBytes = 500KB
                  Url = 'https://github.com/thegraydot/mpqcli/releases/download/v0.9.9/mpqcli-linux-amd64-musl'
                  Sha256 = '12755a0a12b4b6a60baaf88e9d568b2ca99ebed5414d51e9ff689ee37387c4fe' }
@@ -131,6 +159,11 @@ $Paths = @{
 }
 $Paths.Modules = Join-Path $Paths.Source 'modules'
 $Paths.Playerbots = Join-Path $Paths.Modules $Project.Playerbots.Folder
+# Container mode: everything of the container build belongs to Docker\ in the server folder.
+$Paths.Docker     = Join-Path $InstallRoot 'Docker'
+$Paths.Dockerfile = Join-Path $Paths.Docker 'Dockerfile'
+$Paths.Compose    = Join-Path $Paths.Docker 'compose.yml'
+$Paths.ContainerMarker = Join-Path $InstallRoot '.afk-container'
 # A long server folder makes the paths of the build longer than Windows' 260 characters: Boost's installer, the
 # compiler and MSBuild then fail. A new server in a folder longer than 24 characters therefore builds through a short
 # junction, <drive>\afk\<8 characters>, that leads to its Dependencies folder - the files stay where they are, only the
@@ -598,7 +631,10 @@ function Resolve-LinuxToolchain {
                      @{ File = 'readline/readline.h'; Name = 'readline' }, @{ File = 'bzlib.h'; Name = 'bzip2' })) {
         if (-not (Find-Header $h.File)) { $missing.Add($h.Name) }
     }
-    if (-not (Find-Header 'mysql/mysql.h') -and -not (Find-Header 'mariadb/mysql.h')) { $missing.Add('MySQL client library') }
+    if (-not (Find-Header 'mysql/mysql.h') -and -not (Find-Header 'mariadb/mysql.h')) {
+        # In the container the portable MySQL of the image takes this place (see Resolve-LinuxMySqlClient).
+        if (-not $env:AFK_MYSQL_ROOT) { $missing.Add('MySQL client library') }
+    }
     $boost = Find-Header 'boost/version.hpp'
     if ($boost) {
         $m = [regex]::Match([IO.File]::ReadAllText($boost), '#define BOOST_VERSION (\d+)')
@@ -681,6 +717,10 @@ function Use-Boost([string]$Folder) {
 # =============================================================================
 function Get-MySqlTool([string]$Name) {
     if (-not $OnWindows) { $Name = $Name -replace '\.exe$', '' }
+    # Inside a container the portable MySQL of the image is used, not the one of the server
+    # folder: on Windows installs that folder holds the Windows build, which cannot run
+    # inside the Linux container.
+    if ($ContainerEnabled) { return (Join-Path $ContainerMySqlRoot "bin/$Name") }
     return (Join-Path $Paths.MySql "bin\$Name")
 }
 
@@ -781,6 +821,32 @@ function Install-MySql {
 }
 
 function Write-MySqlConfig {
+    if ($ContainerEnabled) {
+        if ($IsInnerEngine) { return }             # the file was written outside; the container uses it as it is
+        # Paths inside the container: MySQL itself is in the image, data and logs are mounted from the server folder.
+        # The whole folder of the server is mounted at /srv. The database listens on every address, because the
+        # ports are only published to the outside in the compose file (127.0.0.1 for the database server).
+        [IO.File]::WriteAllLines($Paths.MyIni, @(
+            '[mysqld]'
+            "basedir=$ContainerMySqlRoot"
+            "datadir=$ContainerRoot/DB/data"
+            "port=$DatabasePort"
+            'bind-address=0.0.0.0'
+            'mysqlx=0'
+            'character-set-server=utf8mb4'
+            'collation-server=utf8mb4_unicode_ci'
+            'max_allowed_packet=128M'
+            "log-error=$ContainerRoot/logs/mysql-error.log"
+            "lc-messages-dir=$ContainerMySqlRoot/share"
+            'secure-file-priv=/tmp'
+            ''
+            '[client]'
+            "port=$DatabasePort"
+            'host=db'
+            'protocol=tcp'
+        ))
+        return
+    }
     $forward = { param($p) $p.Replace('\', '/') }
     $lines = @(
         '[mysqld]'
@@ -824,13 +890,16 @@ function Write-MySqlConfig {
     [IO.File]::WriteAllLines($Paths.MyIni, $lines)
 }
 
-function Test-Port([int]$Port) {
+function Test-Port([int]$Port, [string]$Host_ = '127.0.0.1') {
     $client = New-Object Net.Sockets.TcpClient
     try {
-        $pending = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
+        $pending = $client.BeginConnect($Host_, $Port, $null, $null)
         return ($pending.AsyncWaitHandle.WaitOne(500) -and $client.Connected)
     } catch { return $false } finally { $client.Close() }
 }
+
+# Inside a container the database is not a local process: the port is the sign of life.
+function Get-DatabaseHost { if ($env:AFK_DB_HOST) { return $env:AFK_DB_HOST } else { return '127.0.0.1' } }
 
 function Get-DatabaseProcess {
     if (-not $OnWindows) {
@@ -841,6 +910,12 @@ function Get-DatabaseProcess {
 }
 
 function Start-Database {
+    # Inside a container the engine that drives the containers has already started the database
+    # in its own container; this side only waits for it.
+    if ($ContainerEnabled -and $IsInnerEngine) {
+        for ($i = 0; $i -lt 120; $i++) { if (Test-Port $DatabasePort (Get-DatabaseHost)) { return }; Start-Sleep -Seconds 1 }
+        throw (Tr 'The database did not start. See logs\mysql-error.log.')
+    }
     Write-MySqlConfig
     if (-not (Test-Path (Join-Path $Paths.DbData 'mysql'))) {
         Write-Log 'Creating a new database directory.'
@@ -861,11 +936,13 @@ function Start-Database {
 }
 
 # A temporary MySQL option file keeps passwords off the command line and out of the log.
+# Inside a container the database is reached over the compose network (AFK_DB_HOST, service "db").
 function New-ClientOptions([string]$User, [string]$Password) {
+    $host_ = if ($env:AFK_DB_HOST) { $env:AFK_DB_HOST } else { '127.0.0.1' }
     $file = Join-Path ([IO.Path]::GetTempPath()) ('coa-db-' + [guid]::NewGuid().ToString('N') + '.cnf')
     $text = "[client]`r`nuser=$User`r`n"
     if ($Password) { $text += "password=`"$Password`"`r`n" }
-    $text += "host=127.0.0.1`r`nport=$DatabasePort`r`nprotocol=tcp`r`ndefault-character-set=utf8mb4`r`n"
+    $text += "host=$host_`r`nport=$DatabasePort`r`nprotocol=tcp`r`ndefault-character-set=utf8mb4`r`n"
     [IO.File]::WriteAllText($file, $text, (New-Object Text.UTF8Encoding($false)))
     return $file
 }
@@ -1051,6 +1128,18 @@ UPDATE manastorm_hub_return SET gameobject_guid = @guid WHERE team_id = $($pad.T
 }
 
 function Stop-Database([string]$Password) {
+    if ($ContainerEnabled -and $IsInnerEngine) {
+        # The container ends itself with the clean shutdown; wait for the port to close.
+        $root = New-ClientOptions 'root' $Password
+        try {
+            $previousPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            & (Get-MySqlTool 'mysqladmin.exe') "--defaults-extra-file=$root" shutdown 2>&1 | Out-Null
+            $ErrorActionPreference = $previousPreference
+        } finally { Remove-Item $root -Force -ErrorAction SilentlyContinue }
+        for ($i = 0; $i -lt 60; $i++) { if (-not (Test-Port $DatabasePort (Get-DatabaseHost))) { Write-Log 'Database stopped cleanly.'; return } }
+        throw (Tr 'The database could not be stopped cleanly. Close it manually and check logs\mysql-error.log.')
+    }
     if (@(Get-DatabaseProcess).Count -eq 0) { return }
     $root = New-ClientOptions 'root' $Password
     try {
@@ -1351,14 +1440,20 @@ function Update-ConfigFiles {
     }
 }
 
+# Address of the database in the configurations: inside the container over the compose network.
+function Set-ConnectionHost {
+    if ($ContainerEnabled) { return 'db' } else { return '127.0.0.1' }
+}
+$ContainerDbHost = Set-ConnectionHost
+
 function Set-ServerConfig([string]$Password) {
     Update-ConfigFiles
     $auth = Join-Path $Paths.Configs 'authserver.conf'
     $world = Join-Path $Paths.Configs 'worldserver.conf'
     foreach ($file in $auth, $world) { if (-not (Test-Path $file)) { throw (Tr 'Missing configuration file {0}.' $file) } }
-    $connection = { param($schema) '"127.0.0.1;{0};acore;{1};{2}"' -f $DatabasePort, $Password, $schema }
+    $connection = { param($schema) '"{3};{0};acore;{1};{2}"' -f $DatabasePort, $Password, $schema, $ContainerDbHost }
     $mysql = '"' + (Get-MySqlTool 'mysql.exe').Replace('\', '/') + '"'
-    if (-not $OnWindows) {
+    if (-not $OnWindows -or $ContainerEnabled) {
         # The worldserver reads commands from its terminal and stops at the end of its input; started in the
         # background by AFK Realm it has none. Commands go through the remote service instead.
         Set-ConfigValue $world 'Console.Enable' '0'
@@ -1485,7 +1580,34 @@ function Write-LaunchersLinux([string]$Password) {
     [void](Invoke-Program 'chmod' @('755', $file))
 }
 
+# The simple launchers in container mode: "docker compose up -d" starts the services; the AFK Realm
+# app does the same when it is open.
+function Write-ContainerLaunchers {
+    if ($OnWindows) {
+        $lines = @(
+            '@echo off'
+            'rem Starts the containers of this server (database, authserver, worldserver). Created by AFK Realm.'
+            'cd /d "%~dp0Docker"'
+            'docker compose up -d db auth world'
+            'echo The containers are starting; the log of the worldserver is Server\Server.log.'
+        )
+        [IO.File]::WriteAllLines((Join-Path $Paths.Root 'START-SERVER.cmd'), $lines, [Text.Encoding]::ASCII)
+        return
+    }
+    $lines = @(
+        '#!/bin/sh'
+        '# Starts the containers of this server (database, authserver, worldserver). Created by AFK Realm.'
+        "cd '$($Paths.Docker)' || exit 1"
+        'docker compose up -d db auth world'
+        "echo 'The containers are starting; the log of the worldserver is Server/Server.log.'"
+    )
+    $file = Join-Path $Paths.Root 'start-server.sh'
+    [IO.File]::WriteAllText($file, ($lines -join "`n") + "`n")
+    [void](Invoke-Program 'chmod' @('755', $file))
+}
+
 function Write-Launchers([string]$Password) {
+    if ($ContainerEnabled) { Write-ContainerLaunchers; return }
     if (-not $OnWindows) { Write-LaunchersLinux $Password; return }
     $portCheck = { param($port, $seconds) "powershell -NoProfile -Command `"`$t=[DateTime]::Now.AddSeconds($seconds); while([DateTime]::Now -lt `$t){ try { (New-Object Net.Sockets.TcpClient('127.0.0.1',$port)).Close(); exit 0 } catch { Start-Sleep 1 } }; exit 1`" >nul 2>&1" }
     $mysqld = Join-Path $Paths.MySql 'bin\mysqld.exe'
@@ -2138,6 +2260,7 @@ function Invoke-ModulePatches([string]$Git, [switch]$Quiet) {
 }
 
 function Get-ConfigValue([string]$File, [string]$Key) {
+    if (-not (Test-Path $File)) { return $null }
     $m = [regex]::Match([IO.File]::ReadAllText($File), '(?m)^[ \t]*' + [regex]::Escape($Key) + '[ \t]*=[ \t]*(.*?)[ \t]*\r?$')
     if ($m.Success) { return $m.Groups[1].Value }
     return $null
@@ -2472,6 +2595,7 @@ function Restore-SnapshotParts([string]$Name, [string]$Parts, [string]$Password)
 #  Main
 # =============================================================================
 function Assert-Administrator {
+    if ($ContainerEnabled) { return }                       # everything stays in the server folder and in Docker
     if (-not $OnWindows) {
         # Linux needs no administrator: everything stays in the server folder. Running as root would leave files only
         # root can change, and the servers do not need it.
@@ -2483,6 +2607,12 @@ function Assert-Administrator {
 }
 
 function Assert-ServerStopped {
+    if ($ContainerEnabled -and $IsInnerEngine) { return }   # was already checked outside
+    if ($ContainerEnabled) {
+        $names = @(Get-ContainerServices | Where-Object { $_.Service -in 'auth', 'world' -and $_.State -eq 'running' })
+        if ($names.Count -gt 0) { throw (Tr 'The server is still running. Stop the worldserver and authserver first.') }
+        return
+    }
     $running = @(Get-Process -Name 'worldserver', 'authserver' -ErrorAction SilentlyContinue |
                  Where-Object { try { $_.Path -and $_.Path.StartsWith($Paths.Server, [StringComparison]::OrdinalIgnoreCase) } catch { $false } })
     if ($running.Count -gt 0) { throw (Tr 'The server is still running. Stop the worldserver and authserver first.') }
@@ -2504,6 +2634,353 @@ function Read-Password {
     if ($password.IndexOfAny([char[]]';"\') -ge 0) { throw (Tr 'The database password must not contain a semicolon, quote or backslash.') }
     return $password
 }
+
+# =============================================================================
+#  Containers - the whole server in Debian Trixie containers (Docker)
+# =============================================================================
+# Two images are built from one Dockerfile: <name>-engine (compiler and PowerShell, for building)
+# and <name>-server (runtime libraries and MySQL, for the running db, auth- and worldserver).
+# A compose project binds the whole server folder at /srv with the three services, exactly like
+# the engine sees it while building: the built server is the one that runs. The engine running
+# inside the build container (AFK_ENGINE_CONTAINER=inner) joins the compose network and reaches
+# the database as host "db"; this side talks to the services again only over the published ports.
+
+# Short, stable name of the images, network and containers of this server folder.
+function Set-ContainerProject {
+    $sha = [Security.Cryptography.SHA1]::Create()
+    $hash = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($InstallRoot.ToLowerInvariant()))[0..3] | ForEach-Object { $_.ToString('x2') })
+    return ('afk-' + $hash)
+}
+$ContainerProject = Set-ContainerProject
+$ContainerVersion = if ($env:AC_ENGINE_VERSION) { $env:AC_ENGINE_VERSION } else { 'local' }
+$ContainerImageEngine = ($ContainerProject + '-engine:' + $ContainerVersion)
+$ContainerImageServer = ($ContainerProject + '-server:' + $ContainerVersion)
+$ContainerNetwork = ($ContainerProject + '_default')
+
+# Architecture of the Docker build: the base images bring pwsh and MySQL per architecture.
+function Set-ContainerArch {
+    if ($OnWindows) {
+        $a = $env:PROCESSOR_ARCHITEW6432; if (-not $a) { $a = $env:PROCESSOR_ARCHITECTURE }
+        if ($a -eq 'ARM64') { return 'aarch64' }
+        return 'x86_64'
+    }
+    $m = Get-ProgramOutput 'uname' @('-m')
+    if ($m -like '*aarch64*') { return 'aarch64' }
+    return 'x86_64'
+}
+$ContainerArch = Set-ContainerArch
+
+# The user of the containers: files they write belong to the user of the computer then.
+# Docker Desktop maps every Linux user id to the Windows account, so a fixed value is safe there.
+function Set-ContainerUser {
+    if ($OnWindows) { return '1000:1000' }
+    return ('{0}:{1}' -f (Get-ProgramOutput 'id' @('-u')).Trim(), (Get-ProgramOutput 'id' @('-g')).Trim())
+}
+$ContainerUser = Set-ContainerUser
+
+# The versions the images bring, pinned like the app pins its own PowerShell.
+$PwshVersion = '7.4.6'
+$PwshShaX64 = '6f6015203c47806c5cc444c19d8ed019695e610fbd948154264bf9ca8e157561'
+$PwshShaArm64 = 'c0159b03e85f44ae1e7697818a011558da6c813d0aae848bf5ac13bf435d8624'
+
+function Test-ContainerInstalled {
+    return ((Test-Path $Paths.ContainerMarker) -and (Test-Path $Paths.Compose))
+}
+
+# Docker installed, Compose in place, daemon reachable - or a message telling what to do.
+function Assert-Docker {
+    if (-not (Find-Program 'docker')) {
+        if ($OnWindows) {
+            throw (Tr 'Docker is needed for this server, but it is not installed. Install Docker Desktop from https://www.docker.com/products/docker-desktop/ (it brings a Debian Linux under Windows), then try again.')
+        }
+        throw (Tr 'Docker is needed for this server, but it is not installed. Install it once: {0} - then try again.' (Get-LinuxDockerHint))
+    }
+    $server = Get-ProgramOutput 'docker' @('version', '--format', '{{.Server.Os}} {{.Server.Version}}')
+    if (-not $server) {
+        if ($OnWindows) {
+            throw (Tr 'Docker is installed but not running. Start Docker Desktop, wait until it is ready, then try again.')
+        }
+        throw (Tr 'Docker is installed, but its daemon is not reachable. Start it: sudo systemctl start docker - or make Docker usable without root (see https://docs.docker.com/engine/security/rootless/), then try again.')
+    }
+    $compose = Get-ProgramOutput 'docker' @('compose', 'version', '--short')
+    if (-not $compose) {
+        if ($OnWindows) {
+            throw (Tr 'Docker Desktop is missing its Compose extension here. Reinstalling Docker Desktop (latest version) brings it.')
+        }
+        throw (Tr 'Docker is missing the Compose extension here. Install the Compose package of your distribution (on Debian and Ubuntu: docker-compose-v2), then try again.')
+    }
+    Write-Log ("Docker: " + ($server -split "`n")[0].Trim() + ", Compose " + $compose.Trim())
+}
+
+# The one command that installs Docker on this distribution (as with the build tools).
+function Get-LinuxDockerHint {
+    switch (Get-LinuxPackageManager) {
+        'apt'    { return 'sudo apt install docker.io docker-compose-v2' }
+        'dnf'    { return 'sudo dnf install moby-engine docker-compose' }
+        'pacman' { return 'sudo pacman -S docker docker-compose' }
+        'zypper' { return 'sudo zypper install docker docker-compose' }
+        default  { return 'install Docker and its Compose extension' }
+    }
+}
+
+# The services of this compose project (docker ps with the Compose labels).
+function Get-ContainerServices {
+    $text = Get-ProgramOutput 'docker' @('ps', '-a', '--filter', ('label=com.docker.compose.project=' + $ContainerProject),
+        '--format', '{{.State}} {{.Label "com.docker.compose.service"}}')
+    $result = @()
+    if ($text) {
+        foreach ($line in ($text -split "`n")) {
+            $line = ($line -split "`r")[0]
+            if (-not $line.Trim()) { continue }
+            $p = ($line.Trim() -split '\s+', 2)
+            if ($p.Count -ne 2) { continue }
+            $result += [pscustomobject]@{ Service = $p[1]; State = $p[0] }
+        }
+    }
+    if ($result.Count -eq 0) { return @() }
+    return ,$result
+}
+
+function Test-ContainerRunning([string]$Service) {
+    return (@(Get-ContainerServices | Where-Object { $_.Service -eq $Service -and $_.State -eq 'running' }).Count -gt 0)
+}
+
+# A port from the configuration (already written servers), otherwise the default.
+function Get-ContainerPort([string]$File, [string]$Key, [int]$Fallback) {
+    $value = Get-ConfigValue $File $Key
+    $p = 0
+    if (-not $value -or -not [int]::TryParse(($value -replace '[^0-9]', '').Trim(), [ref]$p) -or $p -lt 1024) { return $Fallback }
+    return $p
+}
+
+# Writes Dockerfile and compose.yml (again): the container files of this server. Versions in the
+# downloads change only when the pins of the engine change; Docker reuses then the cached layers.
+function Write-ContainerFiles {
+    New-Item -ItemType Directory -Force -Path $Paths.Docker | Out-Null
+    $authPort = Get-ContainerPort (Join-Path $Paths.Configs 'authserver.conf') 'RealmServerPort' 3724
+    $worldPort = Get-ContainerPort (Join-Path $Paths.Configs 'worldserver.conf') 'WorldServerPort' 8085
+    $soapPort = Get-ContainerPort (Join-Path $Paths.Configs 'worldserver.conf') 'SOAP.Port' 7878
+
+    $mysqlUrl = $Downloads.MySqlLinux.Url
+    $pwshArch = 'x64'
+    if ($ContainerArch -eq 'aarch64') {
+        $mysqlUrl = $Downloads.MySqlLinuxArm.Url
+        $pwshArch = 'arm64'
+    }
+    $pwshUrl = 'https://github.com/PowerShell/PowerShell/releases/download/v' + $PwshVersion +
+               '/powershell-' + $PwshVersion + '-linux-' + $pwshArch + '.tar.gz'
+    $dockerfile = @'
+# Written by AFK Realm; no need to edit. One file, two images:
+#   base   = everything to run the server (libraries, the portable MySQL),
+#   engine = the compiler stage of the build (also runs the engine with PowerShell).
+FROM debian:trixie-slim AS base
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl xz-utils libaio1t64 libnuma1 libjemalloc2 libssl3t64 \
+      libstdc++6 libgcc-s1 libreadline8t64 libncurses6 libtinfo6 libbz2-1.0 \
+ && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /opt/afk/mysql \
+ && curl -fsSL --retry 3 '{mysqlUrl}' -o /tmp/mysql.tar.xz \
+ && tar -xJf /tmp/mysql.tar.xz -C /opt/afk/mysql --strip-components=1 && rm -f /tmp/mysql.tar.xz
+RUN dir="$(find /usr/lib -name 'libaio.so.1t64*' | head -1)" && allow="$(dirname "$dir")" && ln -sf "$dir" "$allow/libaio.so.1" && ldconfig
+FROM base AS engine
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git cmake ninja-build g++ python3 libssl-dev libbz2-dev libreadline-dev \
+      libncurses-dev libboost-all-dev libjemalloc-dev \
+ && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /opt/afk/pwsh \
+ && curl -fsSL --retry 3 '{pwshUrl}' -o /tmp/pwsh.tar.gz \
+ && tar -xzf /tmp/pwsh.tar.gz -C /opt/afk/pwsh && chmod +x /opt/afk/pwsh/pwsh \
+ && ln -sf /opt/afk/pwsh/pwsh /usr/local/bin/pwsh && rm -f /tmp/pwsh.tar.gz
+'@
+    $dockerfile = $dockerfile.Replace('{mysqlUrl}', $mysqlUrl).Replace('{pwshUrl}', $pwshUrl)
+    [IO.File]::WriteAllText($Paths.Dockerfile, $dockerfile, (New-Object Text.UTF8Encoding($false)))
+
+    $dbPorts = '      - 127.0.0.1:{0}:{0}' -f $DatabasePort
+    $authPorts = @('      - {0}:{0}' -f $authPort) -join "`n"
+    $worldPorts = @((('      - {0}:{0}' -f $worldPort), ('      - {0}:{0}' -f $soapPort)) -join "`n")
+    $compose = @"
+name: $ContainerProject
+services:
+  db:
+    image: $ContainerImageServer
+    user: $ContainerUser
+    volumes: ['../:/srv']
+    ports:
+      $dbPorts
+    stop_grace_period: 60s
+    entrypoint: ['/bin/sh', '-c']
+    command: ['exec /opt/afk/mysql/bin/mysqld --defaults-file=/srv/DB/my.ini']
+  auth:
+    image: $ContainerImageServer
+    user: $ContainerUser
+    volumes: ['../:/srv']
+    ports:
+$authPorts
+    stop_grace_period: 20s
+    entrypoint: ['/bin/sh', '-c']
+    command: ['exec /srv/Server/bin/authserver --config /srv/Server/configs/authserver.conf']
+  world:
+    image: $ContainerImageServer
+    user: $ContainerUser
+    volumes: ['../:/srv']
+    ports:
+$worldPorts
+    stop_grace_period: 179s
+    entrypoint: ['/bin/sh', '-c']
+    command: ['exec /srv/Server/bin/worldserver --config /srv/Server/configs/worldserver.conf']
+"@
+    [IO.File]::WriteAllText($Paths.Compose, $compose, (New-Object Text.UTF8Encoding($false)))
+
+    # The app recognizes this server by the marker (and reads out the compose project from it).
+    [IO.File]::WriteAllLines($Paths.ContainerMarker, @('docker', ('name=' + $ContainerProject)))
+    Write-ContainerBootstrap
+    Write-Log ('Container files written: ' + $Paths.Compose)
+}
+
+function Test-ContainerImage([string]$Tag) { return ($null -ne (Get-ProgramOutput 'docker' @('image', 'inspect', '--format', '{{.Id}}', $Tag))) }
+
+# Builds the missing images (the same layers for both, so the second build only adds on).
+function Build-ContainerImages {
+    if (-not (Test-ContainerImage $ContainerImageServer)) {
+        Write-Log 'Building the base image (Debian Trixie with PowerShell and MySQL; downloaded once) ...'
+        [void](Invoke-Program 'docker' @('build', '--pull', '-f', $Paths.Dockerfile, '--target', 'base', '-t', $ContainerImageServer, $Paths.Docker))
+    }
+    if (-not (Test-ContainerImage $ContainerImageEngine)) {
+        Write-Log 'Building the build image (compiler, cmake, git, Python) ...'
+        [void](Invoke-Program 'docker' @('build', '-f', $Paths.Dockerfile, '--target', 'engine', '-t', $ContainerImageEngine, $Paths.Docker))
+    }
+}
+
+# A fresh database only accepts "root@localhost": the first rights of the containers go in there
+# with a one-time start of the database itself (via socket), before anyone reaches it over the network.
+function Write-ContainerBootstrap {
+    $file = Join-Path $Paths.Docker 'db-bootstrap.sh'
+    $lines = @(
+        '#!/bin/sh'
+        '# Created by AFK Realm. A one-time start of the new database, which then gives the accounts'
+        '# of the server their first rights: afterwards every container may reach the database.'
+        'SOCKET=/tmp/afk-realm-bootstrap.sock'
+        '/opt/afk/mysql/bin/mysqld --defaults-file=/srv/DB/my.ini --skip-networking --socket=$SOCKET >/dev/null 2>&1 &'
+        'PID=$!'
+        'i=0'
+        'while [ $i -lt 90 ]; do'
+        '  if /opt/afk/mysql/bin/mysqladmin --socket=$SOCKET --user=root --protocol=socket ping >/dev/null 2>&1; then break; fi'
+        '  i=$((i+1)); sleep 1'
+        'done'
+        'if [ $i -ge 90 ]; then echo "The new database did not start."; kill $PID 2>/dev/null; exit 1; fi'
+        '/opt/afk/mysql/bin/mysql --socket=$SOCKET --user=root -e "CREATE USER IF NOT EXISTS ''root''@''%'' IDENTIFIED BY \"$AFK_BOOT_PW\"; ALTER USER ''root''@''%'' IDENTIFIED BY \"$AFK_BOOT_PW\"; CREATE USER IF NOT EXISTS ''acore''@''%'' IDENTIFIED BY \"$AFK_BOOT_PW\"; ALTER USER ''acore''@''%'' IDENTIFIED BY \"$AFK_BOOT_PW\"; GRANT ALL PRIVILEGES ON *.* TO ''root''@''%'' WITH GRANT OPTION; GRANT ALL PRIVILEGES ON *.* TO ''acore''@''%''; FLUSH PRIVILEGES;"'
+        'STATUS=$?'
+        'kill -TERM $PID 2>/dev/null'
+        'wait $PID 2>/dev/null'
+        'echo "Database bootstrap: done."'
+        'exit $STATUS'
+    )
+    [IO.File]::WriteAllText($file, (($lines -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
+}
+
+# Writes the configuration again (paths of the container), translates a new database directory and
+# starts the database container. The inner engine waits for the port before its database steps.
+function Start-ContainerDatabase {
+    Write-MySqlConfig
+    Write-ContainerBootstrap
+    if (-not (Test-Path (Join-Path $Paths.DbData 'mysql'))) {
+        Write-Log 'Creating a new database directory (inside the container) ...'
+        New-Item -ItemType Directory -Force -Path $Paths.DbData | Out-Null
+        [void](Invoke-Program 'docker' @('run', '--rm', '--user', $ContainerUser, '-v', ($InstallRoot + ':/srv'), '-w', '/srv',
+            '-e', 'HOME=/tmp', $ContainerImageServer,
+            '/bin/sh', '-c', 'exec /opt/afk/mysql/bin/mysqld --defaults-file=/srv/DB/my.ini --initialize-insecure --console'))
+    }
+    # The first rights of the containers: without them only "root@localhost" works, which no other
+    # container can reach. Runs before the database itself starts in its container.
+    [void](Invoke-Program 'docker' @('run', '--rm', '--user', $ContainerUser, '-v', ($InstallRoot + ':/srv'), '-w', '/srv',
+        '-e', 'HOME=/tmp', '-e', ('AFK_BOOT_PW=' + $password), $ContainerImageServer,
+        '/bin/sh', '/srv/Docker/db-bootstrap.sh'))
+    if (-not (Test-ContainerRunning 'db')) {
+        [void](Invoke-Program 'docker' @('compose', '-f', $Paths.Compose, 'up', '-d', 'db'))
+    }
+    $ok = $false
+    for ($i = 0; $i -lt 120; $i++) { if (Test-Port $DatabasePort) { $ok = $true; break }; Start-Sleep -Seconds 1 }
+    if (-not $ok) { throw (Tr 'The database did not start. See logs\mysql-error.log.') }
+    Write-Log 'The database container is running.'
+}
+
+# Clean shutdown through mysqladmin inside the container (the container ends itself with it).
+function Stop-ContainerDatabase {
+    if (-not (Test-ContainerRunning 'db')) { return }
+    Write-Log 'Stopping the database container ...'
+    [void](Invoke-Program 'docker' @('compose', '-f', $Paths.Compose, 'exec', '-T', '-e', ('MYSQL_PWD=' + $password),
+        'db', '/opt/afk/mysql/bin/mysqladmin', '--user=root', 'shutdown') -AllowFailure)
+    for ($i = 0; $i -lt 90 -and (Test-ContainerRunning 'db'); $i++) { Start-Sleep -Seconds 1 }
+    if (Test-ContainerRunning 'db') { throw (Tr 'The database could not be stopped cleanly. Check logs\mysql-error.log.') }
+}
+
+# Copies the engine itself next to the server (if it is not already there), so that the inner engine
+# runs the exact same code (and finds module-journal.sql there too).
+function Copy-EngineIntoBuilder {
+    $builder = Join-Path $Paths.Root 'Builder'
+    New-Item -ItemType Directory -Force -Path $builder | Out-Null
+    $target = Join-Path $builder 'AFK-Realm-Engine.ps1'
+    if ([IO.Path]::GetFullPath($PSCommandPath) -ne [IO.Path]::GetFullPath($target)) {
+        [IO.File]::Copy($PSCommandPath, $target, $true)
+        $journal = Join-Path $PSScriptRoot 'module-journal.sql'
+        if (Test-Path $journal) { [IO.File]::Copy($journal, (Join-Path $builder 'module-journal.sql'), $true) }
+    }
+}
+
+# Runs the engine again inside the build container: same code as here, but it sees /srv as its
+# server folder and the database as network host "db". The journal and password come along.
+function Invoke-ContainerEngine([string]$Action) {
+    Copy-EngineIntoBuilder
+    $envFile = Join-Path ([IO.Path]::GetTempPath()) ('afk-env-' + [guid]::NewGuid().ToString('N') + '.txt')
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('AC_DB_PASSWORD=' + $password)
+    if ($env:AC_REALM_NAME) { $lines.Add('AC_REALM_NAME=' + $env:AC_REALM_NAME) }
+    if ($env:AC_ENGINE_VERSION) { $lines.Add('AC_ENGINE_VERSION=' + $env:AC_ENGINE_VERSION) }
+    [IO.File]::WriteAllLines($envFile, $lines)
+    $args_ = @('run', '--rm', '--network', $ContainerNetwork, '--user', $ContainerUser,
+        '--env-file', $envFile,
+        '-v', ($InstallRoot + ':/srv'), '-w', '/srv',
+        '-e', 'HOME=/tmp',
+        '-e', 'AFK_ENGINE_CONTAINER=inner',
+        '-e', 'AFK_DB_HOST=db',
+        '-e', ('AFK_MYSQL_ROOT=' + $ContainerMySqlRoot),
+        $ContainerImageEngine,
+        'pwsh', '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', '/srv/Builder/AFK-Realm-Engine.ps1',
+        '-InstallRoot', '/srv', '-DatabasePort', [string]$DatabasePort,
+        '-NonInteractive', '-Mode', $Action, '-Container', 'Docker')
+    if ($Snapshot) { $args_ += @('-Snapshot', $Snapshot) }
+    if ($Parts) { $args_ += @('-Parts', $Parts) }
+    if ($AddModules) { $args_ += @('-AddModules', $AddModules) }
+    if ($RemoveModules) { $args_ += @('-RemoveModules', $RemoveModules) }
+    $code = 0
+    try { $code = Invoke-Program 'docker' $args_ } finally { Remove-Item $envFile -Force -ErrorAction SilentlyContinue }
+    if ($code -ne 0) { throw (Tr 'The build inside Docker ended with code {0}.' $code) }
+    return $code
+}
+
+# Drives the whole run in and around the containers (takes over the main flow after "Mode:").
+# Except Install and Update nothing here touches the Docker images: Setup, Backup, Restore,
+# RestoreParts and Modules run exactly like always - the engine just runs inside the container.
+function Invoke-Container([string]$Action) {
+    $script:ContainerDbWasRunning = $false
+    try { $script:ContainerDbWasRunning = (Test-Port $DatabasePort) } catch { }
+    if (-not $password) { $password = Read-Password }
+    Enter-Phase 'docker' 'Checking Docker'
+    Assert-Docker
+    Write-ContainerFiles
+    Enter-Phase 'image' 'Preparing the container images'
+    Build-ContainerImages
+    Write-Log 'Starting the database container ...'
+    Start-ContainerDatabase
+    Write-Log ('Running the engine inside the container (mode ' + $Action + ') ...')
+    Invoke-ContainerEngine $Action
+    if (-not $script:ContainerDbWasRunning) { Stop-ContainerDatabase }
+    Write-Log ('The container ' + $ContainerProject + ' is set up. The AFK Realm app starts and stops the services from now on.')
+}
+
+$script:ContainerDbWasRunning = $false
 
 # Decides what to do: the -Mode parameter, a menu for an existing server, or a fresh install.
 function Resolve-Mode {
@@ -2544,6 +3021,12 @@ try {
         $action = if ($finished) { 'Setup' } else { 'Resume' }
     }
     Write-Log "Mode: $action"
+    if ($ContainerEnabled -and -not $IsInnerEngine) {
+        # Everything after this point happens in and around the containers (see Invoke-Container).
+        # The engine inside reports on itself: its DONE or FAIL lines and its exit code are enough here.
+        Invoke-Container $action
+        exit 0
+    }
     if ($action -eq 'RestoreParts') {
         if (-not $password) { $password = Read-Password }
         Restore-SnapshotParts $Snapshot $Parts $password
