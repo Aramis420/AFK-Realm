@@ -583,10 +583,37 @@ namespace CoAInstaller
             return DockerLine("compose -f \"" + file + "\" " + arguments);
         }
 
+        /// <summary>The user under which the containers run (from the compose file; they own the files they write).</summary>
+        public string DockerUser
+        {
+            get
+            {
+                return ComposeValue(@"(?m)^\s*user:\s*(\S+)", "1000:1000");
+            }
+        }
+
+        /// <summary>The image of the running services (the server image from the compose file).</summary>
+        public string DockerServerImage
+        {
+            get
+            {
+                return ComposeValue(@"(?m)^\s*image:\s*(\S+server\S+)", "");
+            }
+        }
+
+        string ComposeValue(string pattern, string fallback)
+        {
+            try
+            {
+                var m = Regex.Match(File.ReadAllText(ComposeFile), pattern);
+                return m.Success ? m.Groups[1].Value : fallback;
+            }
+            catch { return fallback; }
+        }
+
         /// <summary>State of the services of the compose project: service name → "running"/"exited"/... .</summary>
         public Dictionary<string, string> DockerServices()
-        {
-            var result = new Dictionary<string, string>();
+        {            var result = new Dictionary<string, string>();
             string output = DockerLine("ps -a --filter \"label=com.docker.compose.project=" + DockerProject + "\" --format \"{{.State}} {{.Label \\\"com.docker.compose.service\\\"}}\"");
             foreach (string line in output.Split('\n'))
             {

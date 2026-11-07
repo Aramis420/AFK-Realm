@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -218,7 +218,16 @@ namespace CoAInstaller.Web
             bool coaDbc = inst.NeedsClientDbc;
             bool onlyDbc = coaDbc && dbcOnly;
             string python = Os.Windows ? inst.PythonExe : FindOnPath("python3");
-            if (coaDbc && (python == null || !File.Exists(python) || !File.Exists(inst.MpqCliExe)))
+            bool inDocker = inst.InDocker;
+            if (inDocker)
+            {
+                // The extractors are built for the container image; they run inside it. Python and the
+                // CoA MPQ tool are in the image (or in the mounted server folder) anyway.
+                python = null;
+            }
+            if (coaDbc && (inDocker
+                ? !File.Exists(Path.Combine(inst.Root, "Dependencies", "Tools", "mpqcli"))
+                : (python == null || !File.Exists(python) || !File.Exists(inst.MpqCliExe))))
                 throw new UserError(L.T("The tools for the CoA DBC extraction are missing. Run \"Repair\" once, then try again."));
             return Jobs.Run(L.T("Create map data"), (job, st) =>
             {
@@ -231,12 +240,13 @@ namespace CoAInstaller.Web
                         string src = Path.Combine(t.EndsWith(".yaml") ? inst.ServerDir : inst.BinDir, t);
                         if (!File.Exists(src) && t.EndsWith(".yaml")) src = Path.Combine(inst.BinDir, t);
                         if (!File.Exists(src)) continue;
+                        if (inDocker && !t.EndsWith(".yaml")) continue;   // the extractors stay in the image; they need no copy
                         string dst = Path.Combine(dir, t);
                         File.Copy(src, dst, true);
                         if (!Os.Windows) File.SetUnixFileMode(dst, File.GetUnixFileMode(src));
                         copied.Add(dst);
                     }
-                    if (!onlyDbc && Os.Windows)
+                    if (!onlyDbc && !inDocker && Os.Windows)
                         foreach (var dll in Directory.GetFiles(inst.ServerDir, "*.dll")) { string dst = Path.Combine(dir, Path.GetFileName(dll)); File.Copy(dll, dst, true); copied.Add(dst); }
 
                     // The whole run also goes to logs\map-data.log, so a Get help ZIP shows why it failed.
@@ -249,21 +259,65 @@ namespace CoAInstaller.Web
                         try { File.AppendAllText(mapLog, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + line + Environment.NewLine); } catch { }
                     };
                     try { Directory.CreateDirectory(inst.LogDir); File.WriteAllText(mapLog, "Create map data from " + dir + Environment.NewLine); } catch { }
-                    Func<string, string, string, int> run = (title, program, arguments) =>
+                    Func<string, string, string, int> run;
+                    if (inDocker)
                     {
-                        st(title);
-                        note("== " + title);
-                        var psi = new ProcessStartInfo(program, arguments)
-                        { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = dir, RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8 };
-                        using (var p = Process.Start(psi))
+                        // A command run inside the server image: the game folder is mounted at /game
+                        // for every step, the extractor then reads its Data folder just as before.
+                        // program == null marks the Python step: the whole command comes in arguments.
+                        string user = Manager.Ctl == null ? "1000:1000" : Manager.Ctl.DockerUser;
+                        string image = Manager.Ctl == null ? "" : Manager.Ctl.DockerServerImage;
+                        if (image.Length == 0) throw new InvalidOperationException(L.T("The container files of this server are incomplete; run \"Repair\"."));
+                        run = (title, program, arguments) =>
                         {
-                            p.OutputDataReceived += (s, e) => { if (e.Data != null) note(e.Data); };
-                            p.ErrorDataReceived += (s, e) => { if (e.Data != null) note(e.Data); };
-                            p.BeginOutputReadLine(); p.BeginErrorReadLine();
-                            p.WaitForExit();
-                            return p.ExitCode;
-                        }
-                    };
+                            st(title);
+                            note("== " + title);
+                            string dockerArgs;
+                            if (program == null)
+                            {
+                                dockerArgs = string.Format("run --rm --user {0} -v \"{1}:/game\" -v \"{2}:/srv\" -w /game -e HOME=/tmp {3} /bin/sh {4}",
+                                    user, dir, inst.Root, image, MySql.Arg(arguments));
+                            }
+                            else
+                            {
+                                string tool = Path.GetFileName(program);
+                                if (tool.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) tool = tool.Substring(0, tool.Length - 4);
+                                string inner = "/srv/Server/bin/" + tool;
+                                string args2 = arguments == "" ? "" : " " + MySql.Arg(arguments);
+                                dockerArgs = string.Format("run --rm --user {0} -v \"{1}:/game\" -v \"{2}:/srv\" -w /game -e HOME=/tmp {3} {4}{5}",
+                                    user, dir, inst.Root, image, inner, args2);
+                            }
+                            var psi = new ProcessStartInfo("docker", dockerArgs)
+                            { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8 };
+                            note("> docker " + dockerArgs);
+                            using (var p = Process.Start(psi))
+                            {
+                                p.OutputDataReceived += (s, e) => { if (e.Data != null) note(e.Data); };
+                                p.ErrorDataReceived += (s, e) => { if (e.Data != null) note(e.Data); };
+                                p.BeginOutputReadLine(); p.BeginErrorReadLine();
+                                p.WaitForExit();
+                                return p.ExitCode;
+                            }
+                        };
+                    }
+                    else
+                    {
+                        run = (title, program, arguments) =>
+                        {
+                            st(title);
+                            note("== " + title);
+                            var psi = new ProcessStartInfo(program, arguments)
+                            { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = dir, RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8 };
+                            using (var p = Process.Start(psi))
+                            {
+                                p.OutputDataReceived += (s, e) => { if (e.Data != null) note(e.Data); };
+                                p.ErrorDataReceived += (s, e) => { if (e.Data != null) note(e.Data); };
+                                p.BeginOutputReadLine(); p.BeginErrorReadLine();
+                                p.WaitForExit();
+                                return p.ExitCode;
+                            }
+                        };
+                    }
                     if (!onlyDbc)
                     {
                         run(L.T("Step 1: dbc, maps and cameras ..."), Path.Combine(dir, Os.Exe("map_extractor")), "");
@@ -273,8 +327,12 @@ namespace CoAInstaller.Web
                     {
                         string coa = Path.Combine(dir, "coa-dbc");
                         if (Directory.Exists(coa)) Directory.Delete(coa, true);
-                        int code = run(L.T("CoA DBC tables from the client archives ..."), python,
-                            MySql.Arg(inst.DbcScript) + " extract " + MySql.Arg(clientData) + " coa-dbc --original --mpqcli " + MySql.Arg(inst.MpqCliExe));
+                        int code = inDocker
+                            ? run(L.T("CoA DBC tables from the client archives ..."), null,
+                                "python3 /srv/Dependencies/Source/" + inst.DbcScript.Substring(inst.SourceDir.Length + 1).Replace('\\', '/') +
+                                " extract /game/Data coa-dbc --original --mpqcli /srv/Dependencies/Tools/mpqcli")
+                            : run(L.T("CoA DBC tables from the client archives ..."), python,
+                                MySql.Arg(inst.DbcScript) + " extract " + MySql.Arg(clientData) + " coa-dbc --original --mpqcli " + MySql.Arg(inst.MpqCliExe));
                         if (code != 0)
                         {
                             string why;

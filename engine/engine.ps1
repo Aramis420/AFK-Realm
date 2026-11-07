@@ -806,6 +806,9 @@ function Start-Detached([string]$Program, [string[]]$Arguments, [string]$Working
 }
 
 function Install-MySql {
+    # Inside a container the database program is in the image; the engine outside keeps the client
+    # tools of its own platform (see Invoke-Container), which it installs with this same function.
+    if ($ContainerEnabled -and $IsInnerEngine) { Write-Log 'MySQL: the container image brings it.'; return }
     if (-not $OnWindows) { Install-MySqlLinux; return }
     if ((Test-Path (Join-Path $Paths.MySql 'bin\mysqld.exe')) -and (Test-Path (Join-Path $Paths.MySql 'lib\mysqlclient.lib'))) { return }
     $zip = Save-Download $Downloads.MySql.Url ('mysql-{0}-winx64.zip' -f $Downloads.MySql.Version) $Downloads.MySql.Sha256 $Downloads.MySql.MinBytes
@@ -2653,9 +2656,16 @@ function Set-ContainerProject {
 }
 $ContainerProject = Set-ContainerProject
 $ContainerVersion = if ($env:AC_ENGINE_VERSION) { $env:AC_ENGINE_VERSION } else { 'local' }
+$ContainerNetwork = ($ContainerProject + '_default')
+# The tags of the images get a short hash of the Dockerfile: a changed recipe builds new images,
+# even when the engine version did not change (or runs by hand without AC_ENGINE_VERSION).
+function ConvertTo-ContainerTagSha([string]$Text) {
+    $sha = [Security.Cryptography.SHA1]::Create()
+    $hash = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text))[0..3] | ForEach-Object { $_.ToString('x2') })
+    return $hash
+}
 $ContainerImageEngine = ($ContainerProject + '-engine:' + $ContainerVersion)
 $ContainerImageServer = ($ContainerProject + '-server:' + $ContainerVersion)
-$ContainerNetwork = ($ContainerProject + '_default')
 
 # Architecture of the Docker build: the base images bring pwsh and MySQL per architecture.
 function Set-ContainerArch {
@@ -2794,6 +2804,11 @@ RUN mkdir -p /opt/afk/pwsh \
  && ln -sf /opt/afk/pwsh/pwsh /usr/local/bin/pwsh && rm -f /tmp/pwsh.tar.gz
 '@
     $dockerfile = $dockerfile.Replace('{mysqlUrl}', $mysqlUrl).Replace('{pwshUrl}', $pwshUrl)
+    # New tags on every change of the recipe: old images stay for the running services until the
+    # next composition; compose brings the new ones with the next "up".
+    $sha = ConvertTo-ContainerTagSha $dockerfile
+    $script:ContainerImageEngine = ($ContainerProject + '-engine:' + $ContainerVersion + '-' + $sha)
+    $script:ContainerImageServer = ($ContainerProject + '-server:' + $ContainerVersion + '-' + $sha)
     [IO.File]::WriteAllText($Paths.Dockerfile, $dockerfile, (New-Object Text.UTF8Encoding($false)))
 
     $dbPorts = '      - 127.0.0.1:{0}:{0}' -f $DatabasePort
@@ -2897,6 +2912,7 @@ function Start-ContainerDatabase {
         '-e', 'HOME=/tmp', '-e', ('AFK_BOOT_PW=' + $password), $ContainerImageServer,
         '/bin/sh', '/srv/Docker/db-bootstrap.sh'))
     if (-not (Test-ContainerRunning 'db')) {
+        if (Test-Port $DatabasePort) { throw (Tr 'Port {0} is already used by another program (another database or repack?). Stop it or choose another port.' $DatabasePort) }
         [void](Invoke-Program 'docker' @('compose', '-f', $Paths.Compose, 'up', '-d', 'db'))
     }
     $ok = $false
@@ -2967,10 +2983,13 @@ function Invoke-Container([string]$Action) {
     $script:ContainerDbWasRunning = $false
     try { $script:ContainerDbWasRunning = (Test-Port $DatabasePort) } catch { }
     if (-not $password) { $password = Read-Password }
-    Enter-Phase 'docker' 'Checking Docker'
+    Enter-Phase 'docker' 'Check Docker'
     Assert-Docker
     Write-ContainerFiles
-    Enter-Phase 'image' 'Preparing the container images'
+    # The app on this computer steers the database with its own client tools: installed here in
+    # the version of this platform (in the container the engine uses the MySQL of the image).
+    Install-MySql
+    Enter-Phase 'image' 'Prepare the container images (Debian Trixie)'
     Build-ContainerImages
     Write-Log 'Starting the database container ...'
     Start-ContainerDatabase
